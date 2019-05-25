@@ -4,7 +4,9 @@ using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Veldrid.ImageSharp
 {
@@ -30,7 +32,7 @@ namespace Veldrid.ImageSharp
         /// <summary>
         /// The pixel format of all images.
         /// </summary>
-        public PixelFormat Format => PixelFormat.R8_G8_B8_A8_UNorm;
+        public PixelFormat Format { get; }
 
         /// <summary>
         /// The size of each pixel, in bytes.
@@ -44,11 +46,17 @@ namespace Veldrid.ImageSharp
 
         public ImageSharpTexture(string path) : this(Image.Load(path), true) { }
         public ImageSharpTexture(string path, bool mipmap) : this(Image.Load(path), mipmap) { }
-        public ImageSharpTexture(Image<Rgba32> image, bool mipmap = true)
+        public ImageSharpTexture(string path, bool mipmap, bool srgb) : this(Image.Load(path), mipmap, srgb) { }
+        public ImageSharpTexture(Stream stream) : this(Image.Load(stream), true) { }
+        public ImageSharpTexture(Stream stream, bool mipmap) : this(Image.Load(stream), mipmap) { }
+        public ImageSharpTexture(Stream stream, bool mipmap, bool srgb) : this(Image.Load(stream), mipmap, srgb) { }
+        public ImageSharpTexture(Image<Rgba32> image, bool mipmap = true) : this(image, mipmap, false) { }
+        public ImageSharpTexture(Image<Rgba32> image, bool mipmap, bool srgb)
         {
+            Format = srgb ? PixelFormat.R8_G8_B8_A8_UNorm_SRgb : PixelFormat.R8_G8_B8_A8_UNorm;
             if (mipmap)
             {
-                Images = GenerateMipmaps(image);
+                Images = MipmapHelper.GenerateMipmaps(image);
             }
             else
             {
@@ -58,23 +66,23 @@ namespace Veldrid.ImageSharp
 
         public unsafe Texture CreateDeviceTexture(GraphicsDevice gd, ResourceFactory factory)
         {
-            return CreateTextureViaStaging(gd, factory);
+            return CreateTextureViaUpdate(gd, factory);
         }
 
         private unsafe Texture CreateTextureViaStaging(GraphicsDevice gd, ResourceFactory factory)
         {
             Texture staging = factory.CreateTexture(
-                TextureDescription.Texture2D(Width, Height, MipLevels, 1, PixelFormat.R8_G8_B8_A8_UNorm, TextureUsage.Staging));
+                TextureDescription.Texture2D(Width, Height, MipLevels, 1, Format, TextureUsage.Staging));
 
             Texture ret = factory.CreateTexture(
-                TextureDescription.Texture2D(Width, Height, MipLevels, 1, PixelFormat.R8_G8_B8_A8_UNorm, TextureUsage.Sampled));
+                TextureDescription.Texture2D(Width, Height, MipLevels, 1, Format, TextureUsage.Sampled));
 
             CommandList cl = gd.ResourceFactory.CreateCommandList();
             cl.Begin();
             for (uint level = 0; level < MipLevels; level++)
             {
                 Image<Rgba32> image = Images[level];
-                fixed (void* pin = &image.DangerousGetPinnableReferenceToPixelBuffer())
+                fixed (void* pin = &MemoryMarshal.GetReference(image.GetPixelSpan()))
                 {
                     MappedResource map = gd.Map(staging, MapMode.Write, level);
                     uint rowWidth = (uint)(image.Width * 4);
@@ -103,8 +111,8 @@ namespace Veldrid.ImageSharp
             cl.End();
 
             gd.SubmitCommands(cl);
-            gd.DisposeWhenIdle(staging);
-            gd.DisposeWhenIdle(cl);
+            staging.Dispose();
+            cl.Dispose();
 
             return ret;
         }
@@ -112,11 +120,11 @@ namespace Veldrid.ImageSharp
         private unsafe Texture CreateTextureViaUpdate(GraphicsDevice gd, ResourceFactory factory)
         {
             Texture tex = factory.CreateTexture(TextureDescription.Texture2D(
-                Width, Height, MipLevels, 1, PixelFormat.R8_G8_B8_A8_UNorm, TextureUsage.Sampled));
+                Width, Height, MipLevels, 1, Format, TextureUsage.Sampled));
             for (int level = 0; level < MipLevels; level++)
             {
                 Image<Rgba32> image = Images[level];
-                fixed (void* pin = &image.DangerousGetPinnableReferenceToPixelBuffer())
+                fixed (void* pin = &MemoryMarshal.GetReference(image.GetPixelSpan()))
                 {
                     gd.UpdateTexture(
                         tex,
@@ -134,35 +142,6 @@ namespace Veldrid.ImageSharp
             }
 
             return tex;
-        }
-
-        private static readonly IResampler s_resampler = new Lanczos3Resampler();
-
-        private static Image<T>[] GenerateMipmaps<T>(Image<T> baseImage) where T : struct, IPixel<T>
-        {
-            int mipLevelCount = MipmapHelper.ComputeMipLevels(baseImage.Width, baseImage.Height);
-            Image<T>[] mipLevels = new Image<T>[mipLevelCount];
-            mipLevels[0] = baseImage;
-            int i = 1;
-
-            int currentWidth = baseImage.Width;
-            int currentHeight = baseImage.Height;
-            while (currentWidth != 1 || currentHeight != 1)
-            {
-                int newWidth = Math.Max(1, currentWidth / 2);
-                int newHeight = Math.Max(1, currentHeight / 2);
-                Image<T> newImage = baseImage.Clone(context => context.Resize(newWidth, newHeight, s_resampler));
-                Debug.Assert(i < mipLevelCount);
-                mipLevels[i] = newImage;
-
-                i++;
-                currentWidth = newWidth;
-                currentHeight = newHeight;
-            }
-
-            Debug.Assert(i == mipLevelCount);
-
-            return mipLevels;
         }
     }
 }

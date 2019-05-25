@@ -5,6 +5,11 @@ namespace Veldrid.Sdl2
 {
     public static unsafe partial class Sdl2Native
     {
+        /// <summary>
+        /// A special sentinel value indicating that a newly-created window should be centered in the screen.
+        /// </summary>
+        public const int SDL_WINDOWPOS_CENTERED = 0x2FFF0000;
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate SDL_Window SDL_CreateWindow_t(string title, int x, int y, int w, int h, SDL_WindowFlags flags);
         private static SDL_CreateWindow_t s_sdl_createWindow = LoadFunction<SDL_CreateWindow_t>("SDL_CreateWindow");
@@ -84,6 +89,26 @@ namespace Veldrid.Sdl2
         private delegate void SDL_HideWindow_t(SDL_Window SDL2Window);
         private static SDL_HideWindow_t s_hideWindow = LoadFunction<SDL_HideWindow_t>("SDL_HideWindow");
         public static void SDL_HideWindow(SDL_Window Sdl2Window) => s_hideWindow(Sdl2Window);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate uint SDL_GetWindowID_t(SDL_Window SDL2Window);
+        private static SDL_GetWindowID_t s_getWindowID = LoadFunction<SDL_GetWindowID_t>("SDL_GetWindowID");
+        public static uint SDL_GetWindowID(SDL_Window Sdl2Window) => s_getWindowID(Sdl2Window);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int SDL_SetWindowOpacity_t(SDL_Window window, float opacity);
+        private static SDL_SetWindowOpacity_t s_setWindowOpacity = LoadFunction<SDL_SetWindowOpacity_t>("SDL_SetWindowOpacity");
+        public static int SDL_SetWindowOpacity(SDL_Window Sdl2Window, float opacity) => s_setWindowOpacity(Sdl2Window, opacity);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int SDL_GetWindowOpacity_t(SDL_Window window, float* opacity);
+        private static SDL_GetWindowOpacity_t s_getWindowOpacity = LoadFunction<SDL_GetWindowOpacity_t>("SDL_GetWindowOpacity");
+        public static int SDL_GetWindowOpacity(SDL_Window Sdl2Window, float* opacity) => s_getWindowOpacity(Sdl2Window, opacity);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SDL_SetWindowResizable_t(SDL_Window window, uint resizable);
+        private static SDL_SetWindowResizable_t s_setWindowResizable = LoadFunction<SDL_SetWindowResizable_t>("SDL_SetWindowResizable");
+        public static void SDL_SetWindowResizable(SDL_Window window, uint resizable) => s_setWindowResizable(window, resizable);
     }
 
     [Flags]

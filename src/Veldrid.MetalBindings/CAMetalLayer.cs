@@ -39,7 +39,25 @@ namespace Veldrid.MetalBindings
             set => objc_msgSend(NativePtr, sel_setDrawableSize, value);
         }
 
+        public CGRect frame
+        {
+            get => CGRect_objc_msgSend(NativePtr, "frame");
+            set => objc_msgSend(NativePtr, "setFrame:", value);
+        }
+
+        public Bool8 opaque
+        {
+            get => bool8_objc_msgSend(NativePtr, "isOpaque");
+            set => objc_msgSend(NativePtr, "setOpaque:", value);
+        }
+
         public CAMetalDrawable nextDrawable() => objc_msgSend<CAMetalDrawable>(NativePtr, sel_nextDrawable);
+
+        public Bool8 displaySyncEnabled
+        {
+            get => bool8_objc_msgSend(NativePtr, "displaySyncEnabled");
+            set => objc_msgSend(NativePtr, "setDisplaySyncEnabled:", value);
+        }
 
         private static readonly Selector sel_device = "device";
         private static readonly Selector sel_setDevice = "setDevice:";

@@ -10,17 +10,20 @@ namespace Veldrid
     public abstract class ResourceLayout : DeviceResource, IDisposable
     {
 #if VALIDATE_USAGE
-        internal readonly ResourceKind[] ResourceKinds;
+        internal readonly ResourceLayoutDescription Description;
+        internal readonly uint DynamicBufferCount;
 #endif
 
         internal ResourceLayout(ref ResourceLayoutDescription description)
         {
 #if VALIDATE_USAGE
-            ResourceLayoutElementDescription[] elements = description.Elements;
-            ResourceKinds = new ResourceKind[elements.Length];
-            for (int i = 0; i < elements.Length; i++)
+            Description = description;
+            foreach (ResourceLayoutElementDescription element in description.Elements)
             {
-                ResourceKinds[i] = elements[i].Kind;
+                if ((element.Options & ResourceLayoutElementOptions.DynamicBinding) != 0)
+                {
+                    DynamicBufferCount += 1;
+                }
             }
 #endif
         }

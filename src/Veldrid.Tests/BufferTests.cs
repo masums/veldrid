@@ -303,13 +303,265 @@ namespace Veldrid.Tests
             }
         }
 
+        [Theory]
+        [InlineData(
+            60, BufferUsage.VertexBuffer, 1,
+            70, BufferUsage.VertexBuffer, 13,
+            11)]
+        [InlineData(
+            60, BufferUsage.Staging, 1,
+            70, BufferUsage.VertexBuffer, 13,
+            11)]
+        [InlineData(
+            60, BufferUsage.VertexBuffer, 1,
+            70, BufferUsage.Staging, 13,
+            11)]
+        [InlineData(
+            60, BufferUsage.Staging, 1,
+            70, BufferUsage.Staging, 13,
+            11)]
+        [InlineData(
+            5, BufferUsage.VertexBuffer, 3,
+            10, BufferUsage.VertexBuffer, 7,
+            2)]
+        public void Copy_UnalignedRegion(
+            uint srcBufferSize, BufferUsage srcUsage, uint srcCopyOffset,
+            uint dstBufferSize, BufferUsage dstUsage, uint dstCopyOffset,
+            uint copySize)
+        {
+            DeviceBuffer src = CreateBuffer(srcBufferSize, srcUsage);
+            DeviceBuffer dst = CreateBuffer(dstBufferSize, dstUsage);
+
+            byte[] data = Enumerable.Range(0, (int)srcBufferSize).Select(i => (byte)i).ToArray();
+            GD.UpdateBuffer(src, 0, data);
+
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+            cl.CopyBuffer(src, srcCopyOffset, dst, dstCopyOffset, copySize);
+            cl.End();
+
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            DeviceBuffer readback = GetReadback(dst);
+
+            MappedResourceView<byte> readView = GD.Map<byte>(readback, MapMode.Read);
+            for (uint i = 0; i < copySize; i++)
+            {
+                byte expected = data[i + srcCopyOffset];
+                byte actual = readView[i + dstCopyOffset];
+                Assert.Equal(expected, actual);
+            }
+            GD.Unmap(readback);
+        }
+
+        [Theory]
+        [InlineData(BufferUsage.VertexBuffer, 13, 5, 1)]
+        [InlineData(BufferUsage.Staging, 13, 5, 1)]
+        public void CommandList_UpdateNonStaging_Unaligned(BufferUsage usage, uint bufferSize, uint dataSize, uint offset)
+        {
+            DeviceBuffer buffer = CreateBuffer(bufferSize, usage);
+            byte[] data = Enumerable.Range(0, (int)dataSize).Select(i => (byte)i).ToArray();
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+            cl.UpdateBuffer(buffer, offset, data);
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            DeviceBuffer readback = GetReadback(buffer);
+            MappedResourceView<byte> readView = GD.Map<byte>(readback, MapMode.Read);
+            for (uint i = 0; i < dataSize; i++)
+            {
+                byte expected = data[i];
+                byte actual = readView[i + offset];
+                Assert.Equal(expected, actual);
+            }
+            GD.Unmap(readback);
+        }
+
+        [Theory]
+        [InlineData(BufferUsage.UniformBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.UniformBuffer)]
+        [InlineData(BufferUsage.Staging)]
+        public void UpdateUniform_Offset_GraphicsDevice(BufferUsage usage)
+        {
+            DeviceBuffer buffer = CreateBuffer(128, usage);
+            Matrix4x4 mat1 = new Matrix4x4(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+            GD.UpdateBuffer(buffer, 0, ref mat1);
+            Matrix4x4 mat2 = new Matrix4x4(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2);
+            GD.UpdateBuffer(buffer, 64, ref mat2);
+
+            DeviceBuffer readback = GetReadback(buffer);
+            MappedResourceView<Matrix4x4> readView = GD.Map<Matrix4x4>(readback, MapMode.Read);
+            Assert.Equal(mat1, readView[0]);
+            Assert.Equal(mat2, readView[1]);
+            GD.Unmap(readback);
+        }
+
+        [Theory]
+        [InlineData(BufferUsage.UniformBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.UniformBuffer)]
+        [InlineData(BufferUsage.Staging)]
+        public void UpdateUniform_Offset_CommandList(BufferUsage usage)
+        {
+            DeviceBuffer buffer = CreateBuffer(128, usage);
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+            Matrix4x4 mat1 = new Matrix4x4(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+            cl.UpdateBuffer(buffer, 0, ref mat1);
+            Matrix4x4 mat2 = new Matrix4x4(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2);
+            cl.UpdateBuffer(buffer, 64, ref mat2);
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            DeviceBuffer readback = GetReadback(buffer);
+            MappedResourceView<Matrix4x4> readView = GD.Map<Matrix4x4>(readback, MapMode.Read);
+            Assert.Equal(mat1, readView[0]);
+            Assert.Equal(mat2, readView[1]);
+            GD.Unmap(readback);
+        }
+
+        [Theory]
+        [InlineData(BufferUsage.UniformBuffer)]
+        [InlineData(BufferUsage.UniformBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.VertexBuffer)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.IndexBuffer)]
+        [InlineData(BufferUsage.IndexBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.IndirectBuffer)]
+        [InlineData(BufferUsage.StructuredBufferReadOnly)]
+        [InlineData(BufferUsage.StructuredBufferReadOnly | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.StructuredBufferReadWrite)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.IndexBuffer)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.IndexBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.IndexBuffer | BufferUsage.IndirectBuffer)]
+        [InlineData(BufferUsage.IndexBuffer | BufferUsage.IndirectBuffer)]
+        [InlineData(BufferUsage.Staging)]
+        public void CreateBuffer_UsageFlagsCoverage(BufferUsage usage)
+        {
+            if ((usage & BufferUsage.StructuredBufferReadOnly) != 0
+                || (usage & BufferUsage.StructuredBufferReadWrite) != 0)
+            {
+                return;
+            }
+
+            BufferDescription description = new BufferDescription(64, usage);
+            if ((usage & BufferUsage.StructuredBufferReadOnly) != 0 || (usage & BufferUsage.StructuredBufferReadWrite) != 0)
+            {
+                description.StructureByteStride = 16;
+            }
+            DeviceBuffer buffer = RF.CreateBuffer(description);
+            GD.UpdateBuffer(buffer, 0, new Vector4[4]);
+            GD.WaitForIdle();
+        }
+
+        [Theory]
+        [InlineData(BufferUsage.UniformBuffer)]
+        [InlineData(BufferUsage.UniformBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.VertexBuffer)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.IndexBuffer)]
+        [InlineData(BufferUsage.IndexBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.IndirectBuffer)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.IndexBuffer)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.IndexBuffer | BufferUsage.Dynamic)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.IndexBuffer | BufferUsage.IndirectBuffer)]
+        [InlineData(BufferUsage.IndexBuffer | BufferUsage.IndirectBuffer)]
+        [InlineData(BufferUsage.Staging)]
+        public unsafe void CopyBuffer_ZeroSize(BufferUsage usage)
+        {
+            DeviceBuffer src = CreateBuffer(1024, usage);
+            DeviceBuffer dst = CreateBuffer(1024, usage);
+
+            byte[] initialDataSrc = Enumerable.Range(0, 1024).Select(i => (byte)i).ToArray();
+            byte[] initialDataDst = Enumerable.Range(0, 1024).Select(i => (byte)(i * 2)).ToArray();
+            GD.UpdateBuffer(src, 0, initialDataSrc);
+            GD.UpdateBuffer(dst, 0, initialDataDst);
+
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+            cl.CopyBuffer(src, 0, dst, 0, 0);
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            DeviceBuffer readback = GetReadback(dst);
+
+            MappedResourceView<byte> readMap = GD.Map<byte>(readback, MapMode.Read);
+            for (int i = 0; i < 1024; i++)
+            {
+                Assert.Equal((byte)(i * 2), readMap[i]);
+            }
+            GD.Unmap(readback);
+        }
+
+        [Theory]
+        [InlineData(BufferUsage.UniformBuffer, false)]
+        [InlineData(BufferUsage.UniformBuffer, true)]
+        [InlineData(BufferUsage.UniformBuffer | BufferUsage.Dynamic, false)]
+        [InlineData(BufferUsage.UniformBuffer | BufferUsage.Dynamic, true)]
+        [InlineData(BufferUsage.VertexBuffer, false)]
+        [InlineData(BufferUsage.VertexBuffer, true)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.Dynamic, false)]
+        [InlineData(BufferUsage.VertexBuffer | BufferUsage.Dynamic, true)]
+        [InlineData(BufferUsage.IndexBuffer, false)]
+        [InlineData(BufferUsage.IndexBuffer, true)]
+        [InlineData(BufferUsage.IndirectBuffer, false)]
+        [InlineData(BufferUsage.IndirectBuffer, true)]
+        [InlineData(BufferUsage.Staging, false)]
+        [InlineData(BufferUsage.Staging, true)]
+        public unsafe void UpdateBuffer_ZeroSize(BufferUsage usage, bool useCommandListUpdate)
+        {
+            DeviceBuffer buffer = CreateBuffer(1024, usage);
+
+            byte[] initialData = Enumerable.Range(0, 1024).Select(i => (byte)i).ToArray();
+            byte[] otherData = Enumerable.Range(0, 1024).Select(i => (byte)(i + 10)).ToArray();
+            GD.UpdateBuffer(buffer, 0, initialData);
+
+            if (useCommandListUpdate)
+            {
+                CommandList cl = RF.CreateCommandList();
+                cl.Begin();
+                fixed (byte* dataPtr = otherData)
+                {
+                    cl.UpdateBuffer(buffer, 0, (IntPtr)dataPtr, 0);
+                }
+                cl.End();
+                GD.SubmitCommands(cl);
+                GD.WaitForIdle();
+            }
+            else
+            {
+                fixed (byte* dataPtr = otherData)
+                {
+                    GD.UpdateBuffer(buffer, 0, (IntPtr)dataPtr, 0);
+                }
+            }
+
+            DeviceBuffer readback = GetReadback(buffer);
+
+            MappedResourceView<byte> readMap = GD.Map<byte>(readback, MapMode.Read);
+            for (int i = 0; i < 1024; i++)
+            {
+                Assert.Equal((byte)i, readMap[i]);
+            }
+            GD.Unmap(readback);
+        }
+
         private DeviceBuffer CreateBuffer(uint size, BufferUsage usage)
         {
             return RF.CreateBuffer(new BufferDescription(size, usage));
         }
     }
 
+#if TEST_OPENGL
     public class OpenGLBufferTests : BufferTestBase<OpenGLDeviceCreator> { }
+#endif
+#if TEST_OPENGLES
+    public class OpenGLESBufferTests : BufferTestBase<OpenGLESDeviceCreator> { }
+#endif
 #if TEST_VULKAN
     public class VulkanBufferTests : BufferTestBase<VulkanDeviceCreator> { }
 #endif

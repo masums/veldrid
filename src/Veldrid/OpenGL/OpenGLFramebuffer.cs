@@ -1,7 +1,6 @@
 ﻿using static Veldrid.OpenGLBinding.OpenGLNative;
 using static Veldrid.OpenGL.OpenGLUtil;
 using Veldrid.OpenGLBinding;
-using System.Diagnostics;
 
 namespace Veldrid.OpenGL
 {
@@ -60,10 +59,7 @@ namespace Veldrid.OpenGL
                     OpenGLTexture glTex = Util.AssertSubtype<Texture, OpenGLTexture>(colorAttachment.Target);
                     glTex.EnsureResourcesCreated();
 
-                    glActiveTexture(TextureUnit.Texture0);
-                    CheckLastError();
-
-                    glBindTexture(glTex.TextureTarget, glTex.Texture);
+                    _gd.TextureSamplerManager.SetTextureTransient(glTex.TextureTarget, glTex.Texture);
                     CheckLastError();
 
                     if (glTex.ArrayLayers == 1)
@@ -73,7 +69,7 @@ namespace Veldrid.OpenGL
                             GLFramebufferAttachment.ColorAttachment0 + i,
                             glTex.TextureTarget,
                             glTex.Texture,
-                            0);
+                            (int)colorAttachment.MipLevel);
                         CheckLastError();
                     }
                     else
@@ -82,7 +78,7 @@ namespace Veldrid.OpenGL
                             FramebufferTarget.Framebuffer,
                             GLFramebufferAttachment.ColorAttachment0 + i,
                             glTex.Texture,
-                            0,
+                            (int)colorAttachment.MipLevel,
                             (int)colorAttachment.ArrayLayer);
                     }
                 }
@@ -105,10 +101,8 @@ namespace Veldrid.OpenGL
                 depthTarget = glDepthTex.TextureTarget;
 
                 depthTextureID = glDepthTex.Texture;
-                glActiveTexture(TextureUnit.Texture0);
-                CheckLastError();
 
-                glBindTexture(depthTarget, glDepthTex.Texture);
+                _gd.TextureSamplerManager.SetTextureTransient(depthTarget, glDepthTex.Texture);
                 CheckLastError();
 
                 GLFramebufferAttachment framebufferAttachment = GLFramebufferAttachment.DepthAttachment;
@@ -124,7 +118,7 @@ namespace Veldrid.OpenGL
                         framebufferAttachment,
                         depthTarget,
                         depthTextureID,
-                        0);
+                        (int)DepthTarget.Value.MipLevel);
                     CheckLastError();
                 }
                 else
@@ -133,7 +127,7 @@ namespace Veldrid.OpenGL
                         FramebufferTarget.Framebuffer,
                         framebufferAttachment,
                         glDepthTex.Texture,
-                        0,
+                        (int)DepthTarget.Value.MipLevel,
                         (int)DepthTarget.Value.ArrayLayer);
                     CheckLastError();
                 }

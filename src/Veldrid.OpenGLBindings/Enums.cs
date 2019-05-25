@@ -128,6 +128,11 @@ namespace Veldrid.OpenGLBinding
         FramebufferExt = 36160
     }
 
+    public enum RenderbufferTarget
+    {
+        Renderbuffer = 36161
+    }
+
     public enum GLFramebufferAttachment
     {
         FrontLeft = 1024,
@@ -545,7 +550,10 @@ namespace Veldrid.OpenGLBinding
         Rg16Snorm = 36761,
         Rgb16Snorm = 36762,
         Rgba16Snorm = 36763,
-        Rgb10A2ui = 36975
+        Rgb10A2ui = 36975,
+        CompressedRgb8Etc2 = 0x9274,
+        CompressedRgb8PunchthroughAlpha1Etc2 = 0x9276,
+        CompressedRgba8Etc2Eac = 0x9278,
     }
 
     public enum PixelStoreParameter
@@ -1645,6 +1653,7 @@ namespace Veldrid.OpenGLBinding
         MaxGeometryImageUniforms = 37069,
         MaxFragmentImageUniforms = 37070,
         MaxCombinedImageUniforms = 37071,
+        ShaderStorageBufferOffsetAlignment = 37087,
         ContextRobustAccess = 37107,
         TextureBinding2DMultisample = 37124,
         TextureBinding2DMultisampleArray = 37125,
@@ -1712,6 +1721,13 @@ namespace Veldrid.OpenGLBinding
         TextureSwizzleB = 36420,
         TextureSwizzleA = 36421,
         TextureSwizzleRgba = 36422
+    }
+
+    public enum StringName
+    {
+        Vendor = 0x1F00,
+        Renderer = 0x1F01,
+        Version = 0x1F02,
     }
 
     public enum StringNameIndexed
@@ -1998,5 +2014,42 @@ namespace Veldrid.OpenGLBinding
         TextureSamples = ((int)0x9106),
         TextureFixedSampleLocations = ((int)0x9107),
         TextureImmutableFormat = ((int)0x912F),
+    }
+
+    public enum RenderbufferPname
+    {
+        RenderbufferWidth = 0x8D42,
+        RenderbufferHeight = 0x8D43,
+    }
+
+    public enum ClipControlOrigin
+    {
+        LowerLeft = 0x8CA1,
+        UpperLeft = 0x8CA2,
+    }
+
+    public enum ClipControlDepthRange
+    {
+        NegativeOneToOne = 0x935E,
+        ZeroToOne = 0x935F,
+    }
+
+    public enum FramebufferParameterName
+    {
+        ColorEncoding = 0x8210,
+        ComponentType = 0x8211,
+        RedSize = 0x8212,
+        GreenSize = 0x8213,
+        BlueSize = 0x8214,
+        AlphaSize = 0x8215,
+        DepthSize = 0x8216,
+        StencilSize = 0x8217,
+        ObjectType = 0x8CD0,
+        ObjectName = 0x8CD1,
+        TextureLvel = 0x8CD2,
+        CubeMapFace = 0x8CD3,
+        TextureLayer = 0x8CD4,
+        Layered = 0x8DA7,
+        LayerTargets = 0x8DA8,
     }
 }

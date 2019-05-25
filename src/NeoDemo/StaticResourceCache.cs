@@ -13,8 +13,8 @@ namespace Veldrid.NeoDemo
         private static readonly Dictionary<ResourceLayoutDescription, ResourceLayout> s_layouts
             = new Dictionary<ResourceLayoutDescription, ResourceLayout>();
 
-        private static readonly Dictionary<(string, ShaderStages), Shader> s_shaders
-            = new Dictionary<(string, ShaderStages), Shader>();
+        private static readonly Dictionary<ShaderSetCacheKey, (Shader, Shader)> s_shaderSets
+            = new Dictionary<ShaderSetCacheKey, (Shader, Shader)>();
 
         private static readonly Dictionary<ImageSharpTexture, Texture> s_textures
             = new Dictionary<ImageSharpTexture, Texture>();
@@ -52,20 +52,20 @@ namespace Veldrid.NeoDemo
             return p;
         }
 
-        public static Shader GetShader(
+        public static (Shader vs, Shader fs) GetShaders(
             GraphicsDevice gd,
             ResourceFactory factory,
-            string name,
-            ShaderStages stage,
-            string entryPoint)
+            string name)
         {
-            if (!s_shaders.TryGetValue((name, stage), out Shader shader))
+            SpecializationConstant[] constants = ShaderHelper.GetSpecializations(gd);
+            ShaderSetCacheKey cacheKey = new ShaderSetCacheKey(name, constants);
+            if (!s_shaderSets.TryGetValue(cacheKey, out (Shader vs, Shader fs) set))
             {
-                shader = ShaderHelper.LoadShader(gd, factory, name, stage, entryPoint);
-                s_shaders.Add((name, stage), shader);
+                set = ShaderHelper.LoadSPIRV(gd, factory, name);
+                s_shaderSets.Add(cacheKey, set);
             }
 
-            return shader;
+            return set;
         }
 
         public static void DestroyAllDeviceObjects()
@@ -82,11 +82,12 @@ namespace Veldrid.NeoDemo
             }
             s_layouts.Clear();
 
-            foreach (KeyValuePair<(string, ShaderStages), Shader> kvp in s_shaders)
+            foreach (KeyValuePair<ShaderSetCacheKey, (Shader, Shader)> kvp in s_shaderSets)
             {
-                kvp.Value.Dispose();
+                kvp.Value.Item1.Dispose();
+                kvp.Value.Item2.Dispose();
             }
-            s_shaders.Clear();
+            s_shaderSets.Clear();
 
             foreach (KeyValuePair<ImageSharpTexture, Texture> kvp in s_textures)
             {

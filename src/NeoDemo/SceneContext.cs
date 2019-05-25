@@ -82,10 +82,10 @@ namespace Veldrid.NeoDemo
             pli.NumActiveLights = 4;
             pli.PointLights = new PointLightInfo[4]
             {
-                new PointLightInfo { Color = new Vector3(1f, 1f, 1f), Position = new Vector3(-50, 5, 0), Range = 75f },
-                new PointLightInfo { Color = new Vector3(1f, .75f, .9f), Position = new Vector3(0, 5, 0), Range = 100f },
-                new PointLightInfo { Color = new Vector3(1f, 1f, 0.6f), Position = new Vector3(50, 5, 0), Range = 40f },
-                new PointLightInfo { Color = new Vector3(0.75f, 0.75f, 1f), Position = new Vector3(25, 5, 45), Range = 150f },
+                new PointLightInfo { Color = new Vector3(.6f, .6f, .6f), Position = new Vector3(-50, 5, 0), Range = 75f },
+                new PointLightInfo { Color = new Vector3(.6f, .35f, .4f), Position = new Vector3(0, 5, 0), Range = 100f },
+                new PointLightInfo { Color = new Vector3(.6f, .6f, 0.35f), Position = new Vector3(50, 5, 0), Range = 40f },
+                new PointLightInfo { Color = new Vector3(0.4f, 0.4f, .6f), Position = new Vector3(25, 5, 45), Range = 150f },
             };
 
             cl.UpdateBuffer(PointLightsBuffer, 0, pli.GetBlittable());
@@ -95,8 +95,8 @@ namespace Veldrid.NeoDemo
                 new ResourceLayoutElementDescription("SourceSampler", ResourceKind.Sampler, ShaderStages.Fragment)));
 
             uint ReflectionMapSize = 2048;
-            ReflectionColorTexture = factory.CreateTexture(TextureDescription.Texture2D(ReflectionMapSize, ReflectionMapSize, 1, 1, PixelFormat.R8_G8_B8_A8_UNorm, TextureUsage.RenderTarget | TextureUsage.Sampled));
-            ReflectionDepthTexture = factory.CreateTexture(TextureDescription.Texture2D(ReflectionMapSize, ReflectionMapSize, 1, 1, PixelFormat.R16_UNorm, TextureUsage.DepthStencil));
+            ReflectionColorTexture = factory.CreateTexture(TextureDescription.Texture2D(ReflectionMapSize, ReflectionMapSize, 12, 1, PixelFormat.R16_G16_B16_A16_Float, TextureUsage.RenderTarget | TextureUsage.Sampled | TextureUsage.GenerateMipmaps));
+            ReflectionDepthTexture = factory.CreateTexture(TextureDescription.Texture2D(ReflectionMapSize, ReflectionMapSize, 1, 1, PixelFormat.R32_Float, TextureUsage.DepthStencil));
             ReflectionColorView = factory.CreateTextureView(ReflectionColorTexture);
             ReflectionFramebuffer = factory.CreateFramebuffer(new FramebufferDescription(ReflectionDepthTexture, ReflectionColorTexture));
             ReflectionViewProjBuffer = factory.CreateBuffer(new BufferDescription(64, BufferUsage.UniformBuffer | BufferUsage.Dynamic));
@@ -176,21 +176,29 @@ namespace Veldrid.NeoDemo
 
             ResourceFactory factory = gd.ResourceFactory;
 
-            TextureSampleCount mainSceneSampleCountCapped = (TextureSampleCount)Math.Min(
-                (int)gd.GetSampleCountLimit(PixelFormat.R8_G8_B8_A8_UNorm, false),
-                (int)MainSceneSampleCount);
+            gd.GetPixelFormatSupport(
+                PixelFormat.R16_G16_B16_A16_Float,
+                TextureType.Texture2D,
+                TextureUsage.RenderTarget,
+                out PixelFormatProperties properties);
+
+            TextureSampleCount sampleCount = MainSceneSampleCount;
+            while (!properties.IsSampleCountSupported(sampleCount))
+            {
+                sampleCount = sampleCount - 1;
+            }
 
             TextureDescription mainColorDesc = TextureDescription.Texture2D(
                 gd.SwapchainFramebuffer.Width,
                 gd.SwapchainFramebuffer.Height,
                 1,
                 1,
-                PixelFormat.R8_G8_B8_A8_UNorm,
+                PixelFormat.R16_G16_B16_A16_Float,
                 TextureUsage.RenderTarget | TextureUsage.Sampled,
-                mainSceneSampleCountCapped);
+                sampleCount);
 
             MainSceneColorTexture = factory.CreateTexture(ref mainColorDesc);
-            if (mainSceneSampleCountCapped != TextureSampleCount.Count1)
+            if (sampleCount != TextureSampleCount.Count1)
             {
                 mainColorDesc.SampleCount = TextureSampleCount.Count1;
                 MainSceneResolvedColorTexture = factory.CreateTexture(ref mainColorDesc);
@@ -205,9 +213,9 @@ namespace Veldrid.NeoDemo
                 gd.SwapchainFramebuffer.Height,
                 1,
                 1,
-                PixelFormat.R16_UNorm,
+                PixelFormat.R32_Float,
                 TextureUsage.DepthStencil,
-                mainSceneSampleCountCapped));
+                sampleCount));
             MainSceneFramebuffer = factory.CreateFramebuffer(new FramebufferDescription(MainSceneDepthTexture, MainSceneColorTexture));
             MainSceneViewResourceSet = factory.CreateResourceSet(new ResourceSetDescription(TextureSamplerResourceLayout, MainSceneResolvedColorView, gd.PointSampler));
 
@@ -216,7 +224,7 @@ namespace Veldrid.NeoDemo
                 gd.SwapchainFramebuffer.Height,
                 1,
                 1,
-                PixelFormat.R8_G8_B8_A8_UNorm,
+                PixelFormat.R16_G16_B16_A16_Float,
                 TextureUsage.RenderTarget | TextureUsage.Sampled);
             DuplicatorTarget0 = factory.CreateTexture(ref colorTargetDesc);
             DuplicatorTargetView0 = factory.CreateTextureView(DuplicatorTarget0);

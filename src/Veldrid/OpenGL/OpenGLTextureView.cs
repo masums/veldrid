@@ -2,7 +2,6 @@
 using Veldrid.OpenGLBinding;
 using static Veldrid.OpenGLBinding.OpenGLNative;
 using static Veldrid.OpenGL.OpenGLUtil;
-using System;
 
 namespace Veldrid.OpenGL
 {
@@ -46,12 +45,23 @@ namespace Veldrid.OpenGL
             Target = Util.AssertSubtype<Texture, OpenGLTexture>(description.Target);
 
             if (BaseMipLevel != 0 || MipLevels != Target.MipLevels
-                || BaseArrayLayer != 0 || ArrayLayers != Target.ArrayLayers)
+                || BaseArrayLayer != 0 || ArrayLayers != Target.ArrayLayers
+                || Format != Target.Format)
             {
-                if (!_gd.Extensions.ARB_TextureView)
+                if (_gd.BackendType == GraphicsBackend.OpenGL)
+                {
+                    if (!_gd.Extensions.ARB_TextureView)
+                    {
+                        throw new VeldridException(
+                            "TextureView objects covering a subset of a Texture's dimensions or using a different PixelFormat " +
+                            "require OpenGL 4.3, or ARB_texture_view.");
+                    }
+                }
+                else
                 {
                     throw new VeldridException(
-                        "TextureView objects covering a subset of a Texture's dimensions require OpenGL 4.3, or ARB_texture_view.");
+                        "TextureView objects covering a subset of a Texture's dimensions or using a different PixelFormat are " +
+                        "not supported on OpenGL ES.");
                 }
                 _needsTextureView = true;
             }
@@ -156,6 +166,11 @@ namespace Veldrid.OpenGL
                 case PixelFormat.BC1_Rgba_UNorm:
                 case PixelFormat.BC2_UNorm:
                 case PixelFormat.BC3_UNorm:
+                case PixelFormat.BC4_UNorm:
+                case PixelFormat.BC4_SNorm:
+                case PixelFormat.BC5_UNorm:
+                case PixelFormat.BC5_SNorm:
+                case PixelFormat.BC7_UNorm:
                 default:
                     throw Illegal.Value<PixelFormat>();
             }
@@ -190,7 +205,22 @@ namespace Veldrid.OpenGL
             CheckLastError();
 
             TextureTarget originalTarget = Target.TextureTarget;
-            if (originalTarget == TextureTarget.Texture2D)
+            if (originalTarget == TextureTarget.Texture1D)
+            {
+                TextureTarget = TextureTarget.Texture1D;
+            }
+            else if (originalTarget == TextureTarget.Texture1DArray)
+            {
+                if (ArrayLayers > 1)
+                {
+                    TextureTarget = TextureTarget.Texture1DArray;
+                }
+                else
+                {
+                    TextureTarget = TextureTarget.Texture1D;
+                }
+            }
+            else if (originalTarget == TextureTarget.Texture2D)
             {
                 TextureTarget = TextureTarget.Texture2D;
             }
@@ -229,8 +259,8 @@ namespace Veldrid.OpenGL
                 throw new VeldridException("The given TextureView parameters are not supported with the OpenGL backend.");
             }
 
-            PixelInternalFormat internalFormat = GetCompatibleInternalFormat(
-                Target.Format,
+            PixelInternalFormat internalFormat = (PixelInternalFormat)OpenGLFormats.VdToGLSizedInternalFormat(
+                Format,
                 (Target.Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil);
             Debug.Assert(Target.Created);
             glTextureView(
@@ -243,37 +273,6 @@ namespace Veldrid.OpenGL
                 BaseArrayLayer,
                 ArrayLayers);
             CheckLastError();
-        }
-
-        private PixelInternalFormat GetCompatibleInternalFormat(PixelFormat vdFormat, bool depthFormat)
-        {
-            switch (vdFormat)
-            {
-                case PixelFormat.R8_G8_B8_A8_UNorm:
-                case PixelFormat.B8_G8_R8_A8_UNorm:
-                    return PixelInternalFormat.Rgba8ui;
-                case PixelFormat.R8_UNorm:
-                    return PixelInternalFormat.R8ui;
-                case PixelFormat.R8_G8_SNorm:
-                    return PixelInternalFormat.Rg8Snorm;
-                case PixelFormat.R16_UNorm:
-                    return depthFormat ? PixelInternalFormat.DepthComponent16 : PixelInternalFormat.R16ui;
-                case PixelFormat.R32_G32_B32_A32_Float:
-                    return PixelInternalFormat.Rgba32f;
-                case PixelFormat.R32_G32_B32_A32_UInt:
-                    return PixelInternalFormat.Rgba32ui;
-                case PixelFormat.R32_Float:
-                    return depthFormat ? PixelInternalFormat.DepthComponent32f : PixelInternalFormat.R32f;
-                case PixelFormat.D32_Float_S8_UInt:
-                    Debug.Assert(depthFormat);
-                    return PixelInternalFormat.Depth32fStencil8;
-                case PixelFormat.D24_UNorm_S8_UInt:
-                    Debug.Assert(depthFormat);
-                    return PixelInternalFormat.Depth24Stencil8;
-                default:
-                    Debug.Fail("Invalid format.");
-                    throw Illegal.Value<PixelInternalFormat>();
-            }
         }
 
         public override void Dispose()

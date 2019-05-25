@@ -58,7 +58,7 @@ namespace Veldrid.MTL
                     (Usage & TextureUsage.Cubemap) != 0);
             if (Usage != TextureUsage.Staging)
             {
-                MTLTextureDescriptor texDescriptor = MTLUtil.AllocInit<MTLTextureDescriptor>();
+                MTLTextureDescriptor texDescriptor = MTLTextureDescriptor.New();
                 texDescriptor.width = (UIntPtr)Width;
                 texDescriptor.height = (UIntPtr)Height;
                 texDescriptor.depth = (UIntPtr)Depth;
@@ -91,51 +91,30 @@ namespace Veldrid.MTL
 
                 StagingBuffer = _gd.Device.newBufferWithLengthOptions(
                     (UIntPtr)totalStorageSize,
-                    MTLResourceOptions.StorageModeManaged);
+                    MTLResourceOptions.StorageModeShared);
             }
         }
 
-        private static MTLTextureType GetTextureType(
-            uint width,
-            uint height,
-            uint depth,
-            uint arrayLayers,
-            TextureUsage usage,
-            TextureSampleCount sampleCount)
+        public MTLTexture(ulong nativeTexture, ref TextureDescription description)
         {
-            bool isCube = (usage & TextureUsage.Cubemap) != 0;
-            if (depth == 1)
-            {
-                if (height == 1)
-                {
-                    // 1D
-                    return arrayLayers == 1 ? MTLTextureType.Type1D : MTLTextureType.Type1DArray;
-                }
-                else
-                {
-                    // 2D
-                    if (isCube)
-                    {
-                        return arrayLayers == 1 ? MTLTextureType.TypeCube : MTLTextureType.TypeCubeArray;
-                    }
-                    else
-                    {
-                        if (sampleCount == TextureSampleCount.Count1)
-                        {
+            DeviceTexture = new MetalBindings.MTLTexture((IntPtr)nativeTexture);
+            Width = description.Width;
+            Height = description.Height;
+            Depth = description.Depth;
+            ArrayLayers = description.ArrayLayers;
+            MipLevels = description.MipLevels;
+            Format = description.Format;
+            Usage = description.Usage;
+            Type = description.Type;
+            SampleCount = description.SampleCount;
+            bool isDepth = (Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil;
 
-                            return arrayLayers == 1 ? MTLTextureType.Type2D : MTLTextureType.Type2DArray;
-                        }
-                        else
-                        {
-                            return MTLTextureType.Type2DMultisample;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                return MTLTextureType.Type3D;
-            }
+            MTLPixelFormat = MTLFormats.VdToMTLPixelFormat(Format, isDepth);
+            MTLTextureType = MTLFormats.VdToMTLTextureType(
+                    Type,
+                    ArrayLayers,
+                    SampleCount != TextureSampleCount.Count1,
+                    (Usage & TextureUsage.Cubemap) != 0);
         }
 
         internal uint GetSubresourceSize(uint mipLevel, uint arrayLayer)
@@ -160,7 +139,7 @@ namespace Veldrid.MTL
             depthPitch = FormatHelpers.GetDepthPitch(rowPitch, storageHeight, Format);
         }
 
-        public override void Dispose()
+        private protected override void DisposeCore()
         {
             if (!_disposed)
             {

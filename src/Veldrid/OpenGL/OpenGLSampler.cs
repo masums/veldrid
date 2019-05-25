@@ -48,8 +48,9 @@ namespace Veldrid.OpenGL
 
         private void CreateGLResources()
         {
-            _noMipmapState.CreateGLResources(_description, false);
-            _mipmapState.CreateGLResources(_description, true);
+            GraphicsBackend backendType = _gd.BackendType;
+            _noMipmapState.CreateGLResources(_description, false, backendType);
+            _mipmapState.CreateGLResources(_description, true, backendType);
             Created = true;
         }
 
@@ -70,7 +71,7 @@ namespace Veldrid.OpenGL
 
             public uint Sampler => _sampler;
 
-            public void CreateGLResources(SamplerDescription description, bool mipmapped)
+            public void CreateGLResources(SamplerDescription description, bool mipmapped, GraphicsBackend backend)
             {
                 glGenSamplers(1, out _sampler);
                 CheckLastError();
@@ -93,10 +94,13 @@ namespace Veldrid.OpenGL
 
                 glSamplerParameterf(_sampler, SamplerParameterName.TextureMinLod, description.MinimumLod);
                 CheckLastError();
-                glSamplerParameterf(_sampler, SamplerParameterName.TextureMaxLod, description.MaximumAnisotropy);
+                glSamplerParameterf(_sampler, SamplerParameterName.TextureMaxLod, description.MaximumLod);
                 CheckLastError();
-                glSamplerParameterf(_sampler, SamplerParameterName.TextureLodBias, description.LodBias);
-                CheckLastError();
+                if (backend == GraphicsBackend.OpenGL && description.LodBias != 0)
+                {
+                    glSamplerParameterf(_sampler, SamplerParameterName.TextureLodBias, description.LodBias);
+                    CheckLastError();
+                }
 
                 if (description.Filter == SamplerFilter.Anisotropic)
                 {

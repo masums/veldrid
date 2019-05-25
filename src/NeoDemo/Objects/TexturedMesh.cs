@@ -1,5 +1,4 @@
-﻿using ShaderGen;
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.CompilerServices;
 using System;
 using Veldrid.ImageSharp;
@@ -10,6 +9,10 @@ namespace Veldrid.NeoDemo.Objects
 {
     public class TexturedMesh : CullRenderable
     {
+        // Useful for testing uniform bindings with an offset.
+        private static readonly bool s_useUniformOffset = false;
+        private uint _uniformOffset = 0;
+
         private readonly string _name;
         private readonly MeshData _meshData;
         private readonly ImageSharpTexture _textureData;
@@ -21,7 +24,6 @@ namespace Veldrid.NeoDemo.Objects
         private DeviceBuffer _ib;
         private int _indexCount;
         private Texture _texture;
-        private TextureView _textureView;
         private Texture _alphamapTexture;
         private TextureView _alphaMapView;
 
@@ -35,13 +37,12 @@ namespace Veldrid.NeoDemo.Objects
         private Pipeline _shadowMapPipeline;
         private ResourceSet[] _shadowMapResourceSets;
 
-        private DeviceBuffer _worldBuffer;
-        private DeviceBuffer _inverseTransposeWorldBuffer;
+        private DeviceBuffer _worldAndInverseBuffer;
 
         private readonly DisposeCollector _disposeCollector = new DisposeCollector();
 
         private readonly MaterialPropsAndBuffer _materialProps;
-
+        private readonly Vector3 _objectCenter;
         private bool _materialPropsOwned = false;
 
         public MaterialProperties MaterialProperties { get => _materialProps.Properties; set { _materialProps.Properties = value; } }
@@ -53,6 +54,7 @@ namespace Veldrid.NeoDemo.Objects
             _name = name;
             _meshData = meshData;
             _centeredBounds = meshData.GetBoundingBox();
+            _objectCenter = _centeredBounds.GetCenter();
             _textureData = textureData;
             _alphaTextureData = alphaTexture;
             _materialProps = materialProps;
@@ -62,14 +64,20 @@ namespace Veldrid.NeoDemo.Objects
 
         public unsafe override void CreateDeviceObjects(GraphicsDevice gd, CommandList cl, SceneContext sc)
         {
+            if (s_useUniformOffset)
+            {
+                _uniformOffset = gd.UniformBufferMinOffsetAlignment;
+            }
             ResourceFactory disposeFactory = new DisposeCollectorResourceFactory(gd.ResourceFactory, _disposeCollector);
             _vb = _meshData.CreateVertexBuffer(disposeFactory, cl);
             _vb.Name = _name + "_VB";
             _ib = _meshData.CreateIndexBuffer(disposeFactory, cl, out _indexCount);
             _ib.Name = _name + "_IB";
 
-            _worldBuffer = disposeFactory.CreateBuffer(new BufferDescription(64, BufferUsage.UniformBuffer | BufferUsage.Dynamic));
-            _inverseTransposeWorldBuffer = disposeFactory.CreateBuffer(new BufferDescription(64, BufferUsage.UniformBuffer | BufferUsage.Dynamic));
+            uint bufferSize = 128;
+            if (s_useUniformOffset) { bufferSize += _uniformOffset * 2; }
+
+            _worldAndInverseBuffer = disposeFactory.CreateBuffer(new BufferDescription(bufferSize, BufferUsage.UniformBuffer | BufferUsage.Dynamic));
             if (_materialPropsOwned)
             {
                 _materialProps.CreateDeviceObjects(gd, cl, sc);
@@ -86,8 +94,6 @@ namespace Veldrid.NeoDemo.Objects
                 gd.UpdateTexture(_texture, (IntPtr)(&color), 4, 0, 0, 0, 1, 1, 1, 0, 0);
             }
 
-            _textureView = StaticResourceCache.GetTextureView(gd.ResourceFactory, _texture);
-
             if (_alphaTextureData != null)
             {
                 _alphamapTexture = _alphaTextureData.CreateDeviceTexture(gd, disposeFactory);
@@ -101,13 +107,12 @@ namespace Veldrid.NeoDemo.Objects
             VertexLayoutDescription[] shadowDepthVertexLayouts = new VertexLayoutDescription[]
             {
                 new VertexLayoutDescription(
-                    new VertexElementDescription("Position", VertexElementSemantic.Position, VertexElementFormat.Float3),
-                    new VertexElementDescription("Normal", VertexElementSemantic.Normal, VertexElementFormat.Float3),
+                    new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+                    new VertexElementDescription("Normal", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
                     new VertexElementDescription("TexCoord", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float2))
             };
 
-            Shader depthVS = StaticResourceCache.GetShader(gd, gd.ResourceFactory, "ShadowDepth", ShaderStages.Vertex, "VS");
-            Shader depthFS = StaticResourceCache.GetShader(gd, gd.ResourceFactory, "ShadowDepth", ShaderStages.Fragment, "FS");
+            (Shader depthVS, Shader depthFS) = StaticResourceCache.GetShaders(gd, gd.ResourceFactory, "ShadowDepth");
 
             ResourceLayout projViewCombinedLayout = StaticResourceCache.GetResourceLayout(
                 gd.ResourceFactory,
@@ -115,16 +120,19 @@ namespace Veldrid.NeoDemo.Objects
                     new ResourceLayoutElementDescription("ViewProjection", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
 
             ResourceLayout worldLayout = StaticResourceCache.GetResourceLayout(gd.ResourceFactory, new ResourceLayoutDescription(
-                new ResourceLayoutElementDescription("World", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
+                new ResourceLayoutElementDescription("WorldAndInverse", ResourceKind.UniformBuffer, ShaderStages.Vertex, ResourceLayoutElementOptions.DynamicBinding)));
 
             GraphicsPipelineDescription depthPD = new GraphicsPipelineDescription(
                 BlendStateDescription.Empty,
-                DepthStencilStateDescription.DepthOnlyLessEqual,
+                gd.IsDepthRangeZeroToOne ? DepthStencilStateDescription.DepthOnlyGreaterEqual : DepthStencilStateDescription.DepthOnlyLessEqual,
                 RasterizerStateDescription.Default,
                 PrimitiveTopology.TriangleList,
-                new ShaderSetDescription(shadowDepthVertexLayouts, new[] { depthVS, depthFS }),
+                new ShaderSetDescription(
+                    shadowDepthVertexLayouts,
+                    new[] { depthVS, depthFS },
+                    new[] { new SpecializationConstant(100, gd.IsClipSpaceYInverted) }),
                 new ResourceLayout[] { projViewCombinedLayout, worldLayout },
-                DemoOutputsDescriptions.ShadowMapPass);
+                sc.NearShadowMapFramebuffer.OutputDescription);
             _shadowMapPipeline = StaticResourceCache.GetPipeline(gd.ResourceFactory, ref depthPD);
 
             _shadowMapResourceSets = CreateShadowMapResourceSets(gd.ResourceFactory, disposeFactory, cl, sc, projViewCombinedLayout, worldLayout);
@@ -132,13 +140,12 @@ namespace Veldrid.NeoDemo.Objects
             VertexLayoutDescription[] mainVertexLayouts = new VertexLayoutDescription[]
             {
                 new VertexLayoutDescription(
-                    new VertexElementDescription("Position", VertexElementSemantic.Position, VertexElementFormat.Float3),
-                    new VertexElementDescription("Normal", VertexElementSemantic.Normal, VertexElementFormat.Float3),
+                    new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+                    new VertexElementDescription("Normal", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
                     new VertexElementDescription("TexCoord", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float2))
             };
 
-            Shader mainVS = StaticResourceCache.GetShader(gd, gd.ResourceFactory, "ShadowMain", ShaderStages.Vertex, "VS");
-            Shader mainFS = StaticResourceCache.GetShader(gd, gd.ResourceFactory, "ShadowMain", ShaderStages.Fragment, "FS");
+            (Shader mainVS, Shader mainFS) = StaticResourceCache.GetShaders(gd, gd.ResourceFactory, "ShadowMain");
 
             ResourceLayout projViewLayout = StaticResourceCache.GetResourceLayout(
                 gd.ResourceFactory,
@@ -154,8 +161,7 @@ namespace Veldrid.NeoDemo.Objects
                 new ResourceLayoutElementDescription("PointLights", ResourceKind.UniformBuffer, ShaderStages.Vertex | ShaderStages.Fragment)));
 
             ResourceLayout mainPerObjectLayout = StaticResourceCache.GetResourceLayout(gd.ResourceFactory, new ResourceLayoutDescription(
-                new ResourceLayoutElementDescription("World", ResourceKind.UniformBuffer, ShaderStages.Vertex | ShaderStages.Fragment),
-                new ResourceLayoutElementDescription("InverseTransposeWorld", ResourceKind.UniformBuffer, ShaderStages.Vertex | ShaderStages.Fragment),
+                new ResourceLayoutElementDescription("WorldAndInverse", ResourceKind.UniformBuffer, ShaderStages.Vertex | ShaderStages.Fragment, ResourceLayoutElementOptions.DynamicBinding),
                 new ResourceLayoutElementDescription("MaterialProperties", ResourceKind.UniformBuffer, ShaderStages.Vertex | ShaderStages.Fragment),
                 new ResourceLayoutElementDescription("SurfaceTexture", ResourceKind.TextureReadOnly, ShaderStages.Fragment),
                 new ResourceLayoutElementDescription("RegularSampler", ResourceKind.Sampler, ShaderStages.Fragment),
@@ -174,13 +180,14 @@ namespace Veldrid.NeoDemo.Objects
 
             GraphicsPipelineDescription mainPD = new GraphicsPipelineDescription(
                 _alphamapTexture != null ? BlendStateDescription.SingleAlphaBlend : BlendStateDescription.SingleOverrideBlend,
-                DepthStencilStateDescription.DepthOnlyLessEqual,
+                gd.IsDepthRangeZeroToOne ? DepthStencilStateDescription.DepthOnlyGreaterEqual : DepthStencilStateDescription.DepthOnlyLessEqual,
                 RasterizerStateDescription.Default,
                 PrimitiveTopology.TriangleList,
-                new ShaderSetDescription(mainVertexLayouts, new[] { mainVS, mainFS }),
+                new ShaderSetDescription(mainVertexLayouts, new[] { mainVS, mainFS }, new[] { new SpecializationConstant(100, gd.IsClipSpaceYInverted) }),
                 new ResourceLayout[] { projViewLayout, mainSharedLayout, mainPerObjectLayout, reflectionLayout },
                 sc.MainSceneFramebuffer.OutputDescription);
             _pipeline = StaticResourceCache.GetPipeline(gd.ResourceFactory, ref mainPD);
+            _pipeline.Name = "TexturedMesh Main Pipeline";
             mainPD.RasterizerState.CullMode = FaceCullMode.Front;
             mainPD.Outputs = sc.ReflectionFramebuffer.OutputDescription;
             _pipelineFrontCull = StaticResourceCache.GetPipeline(gd.ResourceFactory, ref mainPD);
@@ -199,10 +206,9 @@ namespace Veldrid.NeoDemo.Objects
                 sc.PointLightsBuffer));
 
             _mainPerObjectRS = disposeFactory.CreateResourceSet(new ResourceSetDescription(mainPerObjectLayout,
-                _worldBuffer,
-                _inverseTransposeWorldBuffer,
+                new DeviceBufferRange(_worldAndInverseBuffer, _uniformOffset, 128),
                 _materialProps.UniformBuffer,
-                _textureView,
+                _texture,
                 gd.Aniso4xSampler,
                 _alphaMapView,
                 gd.LinearSampler,
@@ -242,7 +248,7 @@ namespace Veldrid.NeoDemo.Objects
                     viewProjBuffer));
                 ResourceSet worldRS = disposeFactory.CreateResourceSet(new ResourceSetDescription(
                     worldLayout,
-                    _worldBuffer));
+                    new DeviceBufferRange(_worldAndInverseBuffer, _uniformOffset, 128)));
                 ret[i * 2 + 1] = worldRS;
             }
 
@@ -261,7 +267,9 @@ namespace Veldrid.NeoDemo.Objects
 
         public override RenderOrderKey GetRenderOrderKey(Vector3 cameraPosition)
         {
-            return RenderOrderKey.Create(_pipeline.GetHashCode(), Vector3.Distance(_transform.Position, cameraPosition));
+            return RenderOrderKey.Create(
+                _pipeline.GetHashCode(),
+                Vector3.Distance((_objectCenter * _transform.Scale) + _transform.Position, cameraPosition));
         }
 
         public override RenderPasses RenderPasses
@@ -303,9 +311,10 @@ namespace Veldrid.NeoDemo.Objects
 
         public override void UpdatePerFrameResources(GraphicsDevice gd, CommandList cl, SceneContext sc)
         {
-            Matrix4x4 world = _transform.GetTransformMatrix();
-            gd.UpdateBuffer(_worldBuffer, 0, ref world);
-            gd.UpdateBuffer(_inverseTransposeWorldBuffer, 0, VdUtilities.CalculateInverseTranspose(ref world));
+            WorldAndInverse wai;
+            wai.World = _transform.GetTransformMatrix();
+            wai.InverseWorld = VdUtilities.CalculateInverseTranspose(ref wai.World);
+            gd.UpdateBuffer(_worldAndInverseBuffer, _uniformOffset * 2, ref wai);
         }
 
         private void RenderShadowMap(CommandList cl, SceneContext sc, int shadowMapIndex)
@@ -314,7 +323,8 @@ namespace Veldrid.NeoDemo.Objects
             cl.SetIndexBuffer(_ib, IndexFormat.UInt16);
             cl.SetPipeline(_shadowMapPipeline);
             cl.SetGraphicsResourceSet(0, _shadowMapResourceSets[shadowMapIndex * 2]);
-            cl.SetGraphicsResourceSet(1, _shadowMapResourceSets[shadowMapIndex * 2 + 1]);
+            uint offset = _uniformOffset;
+            cl.SetGraphicsResourceSet(1, _shadowMapResourceSets[shadowMapIndex * 2 + 1], 1, ref offset);
             cl.DrawIndexed((uint)_indexCount, 1, 0, 0, 0);
         }
 
@@ -325,9 +335,16 @@ namespace Veldrid.NeoDemo.Objects
             cl.SetPipeline(reflectionPass ? _pipelineFrontCull : _pipeline);
             cl.SetGraphicsResourceSet(0, _mainProjViewRS);
             cl.SetGraphicsResourceSet(1, _mainSharedRS);
-            cl.SetGraphicsResourceSet(2, _mainPerObjectRS);
+            uint offset = _uniformOffset;
+            cl.SetGraphicsResourceSet(2, _mainPerObjectRS, 1, ref offset);
             cl.SetGraphicsResourceSet(3, reflectionPass ? _reflectionRS : _noReflectionRS);
             cl.DrawIndexed((uint)_indexCount, 1, 0, 0, 0);
         }
+    }
+
+    public struct WorldAndInverse
+    {
+        public Matrix4x4 World;
+        public Matrix4x4 InverseWorld;
     }
 }

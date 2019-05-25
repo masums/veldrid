@@ -2,13 +2,12 @@ namespace Veldrid.MTL
 {
     internal class MTLResourceSet : ResourceSet
     {
-        public BindableResource[] Resources { get; }
-        public MTLResourceLayout Layout { get; }
+        public new BindableResource[] Resources { get; }
+        public new MTLResourceLayout Layout { get; }
 
-        public MTLResourceSet(ref ResourceSetDescription description, MTLGraphicsDevice gd)
-            : base(ref description)
+        public MTLResourceSet(ref ResourceSetDescription description, MTLGraphicsDevice gd) : base(ref description)
         {
-            Resources = description.BoundResources;
+            Resources = Util.ShallowClone(description.BoundResources);
             Layout = Util.AssertSubtype<ResourceLayout, MTLResourceLayout>(description.Layout);
         }
 

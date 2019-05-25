@@ -1,4 +1,5 @@
 ﻿using System;
+using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -20,6 +21,16 @@ namespace Veldrid.Sdl2
         private delegate void SDL_AddEventWatch_t(SDL_EventFilter filter, void* userdata);
         private static SDL_AddEventWatch_t s_sdl_addEventWatch = LoadFunction<SDL_AddEventWatch_t>("SDL_AddEventWatch");
         public static void SDL_AddEventWatch(SDL_EventFilter filter, void* userdata) => s_sdl_addEventWatch(filter, userdata);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SDL_SetEventFilter_t(SDL_EventFilter filter, void* userdata);
+        private static SDL_SetEventFilter_t s_sdl_setEventFilter = LoadFunction<SDL_SetEventFilter_t>("SDL_SetEventFilter");
+        public static void SDL_SetEventFilter(SDL_EventFilter filter, void* userdata) => s_sdl_setEventFilter(filter, userdata);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SDL_FilterEvents_t(SDL_EventFilter filter, void* userdata);
+        private static SDL_FilterEvents_t s_sdl_filterEvents = LoadFunction<SDL_FilterEvents_t>("SDL_FilterEvents");
+        public static void SDL_FilterEvents(SDL_EventFilter filter, void* userdata) => s_sdl_filterEvents(filter, userdata);
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -30,7 +41,10 @@ namespace Veldrid.Sdl2
     {
         [FieldOffset(0)]
         public SDL_EventType type;
-
+        [FieldOffset(4)]
+        public uint timestamp;
+        [FieldOffset(8)]
+        public uint windowID;
         [FieldOffset(0)]
         private Bytex56 __padding;
         private unsafe struct Bytex56 { private fixed byte bytes[56]; }
@@ -317,7 +331,12 @@ namespace Veldrid.Sdl2
         /// <summary>
         /// text/plain drag-and-drop event
         /// </summary>
+        [EditorBrowsable(EditorBrowsableState.Never)]
         DropTest,
+        /// <summary>
+        /// text/plain drag-and-drop event
+        /// </summary>
+        DropText = DropTest,
         /// <summary>
         /// A new set of drops is beginning (NULL filename) 
         /// </summary>
@@ -554,5 +573,19 @@ namespace Veldrid.Sdl2
         /// The input text.
         /// </summary>
         public fixed byte text[MaxTextSize];
+    }
+
+    public unsafe struct SDL_DropEvent
+    {
+        /// <summary>
+        /// SDL_DROPFILE, SDL_DROPTEXT, SDL_DROPBEGIN, or SDL_DROPCOMPLETE.
+        /// </summary>
+        public SDL_EventType type;
+        /// <summary>timestamp of the event.</summary>
+        public uint timestamp;
+        /// <summary>the file name, which should be freed with SDL_free(), is NULL on BEGIN/COMPLETE</summary>
+        public byte* file;
+        /// <summary>the window that was dropped on, if any</summary>
+        public uint windowID;
     }
 }

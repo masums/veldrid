@@ -5,7 +5,7 @@
     /// Each name is a compound identifier, where each component denotes a name and a number of bits used to store that
     /// component. The final component identifies the storage type of each component. "Float" identifies a signed, floating-point
     /// type, UNorm identifies an unsigned integer type which is normalized, meaning it occupies the full space of the integer
-    /// type.
+    /// type. The SRgb suffix for normalized integer formats indicates that the RGB components are stored in sRGB format.
     /// </summary>
     public enum PixelFormat : byte
     {
@@ -200,5 +200,73 @@
         /// RGBA component order. Each component is a 32-bit signed integer.
         /// </summary>
         R32_G32_B32_A32_SInt,
+        /// <summary>
+        /// A 64-bit, 4x4 block-compressed format storing unsigned normalized RGB data.
+        /// </summary>
+        ETC2_R8_G8_B8_UNorm,
+        /// <summary>
+        /// A 64-bit, 4x4 block-compressed format storing unsigned normalized RGB data, as well as 1 bit of alpha data.
+        /// </summary>
+        ETC2_R8_G8_B8_A1_UNorm,
+        /// <summary>
+        /// A 128-bit, 4x4 block-compressed format storing 64 bits of unsigned normalized RGB data, as well as 64 bits of alpha
+        /// data.
+        /// </summary>
+        ETC2_R8_G8_B8_A8_UNorm,
+        /// <summary>
+        /// BC4 block compressed format, unsigned normalized values.
+        /// </summary>
+        BC4_UNorm,
+        /// <summary>
+        /// BC4 block compressed format, signed normalized values.
+        /// </summary>
+        BC4_SNorm,
+        /// <summary>
+        /// BC5 block compressed format, unsigned normalized values.
+        /// </summary>
+        BC5_UNorm,
+        /// <summary>
+        /// BC5 block compressed format, signed normalized values.
+        /// </summary>
+        BC5_SNorm,
+        /// <summary>
+        /// BC7 block compressed format.
+        /// </summary>
+        BC7_UNorm,
+        /// <summary>
+        /// RGBA component order. Each component is an 8-bit unsigned normalized integer.
+        /// This is an sRGB format.
+        /// </summary>
+        R8_G8_B8_A8_UNorm_SRgb,
+        /// <summary>
+        /// BGRA component order. Each component is an 8-bit unsigned normalized integer.
+        /// This is an sRGB format.
+        /// </summary>
+        B8_G8_R8_A8_UNorm_SRgb,
+        /// <summary>
+        /// BC1 block compressed format with no alpha.
+        /// This is an sRGB format.
+        /// </summary>
+        BC1_Rgb_UNorm_SRgb,
+        /// <summary>
+        /// BC1 block compressed format with a single-bit alpha channel.
+        /// This is an sRGB format.
+        /// </summary>
+        BC1_Rgba_UNorm_SRgb,
+        /// <summary>
+        /// BC2 block compressed format.
+        /// This is an sRGB format.
+        /// </summary>
+        BC2_UNorm_SRgb,
+        /// <summary>
+        /// BC3 block compressed format.
+        /// This is an sRGB format.
+        /// </summary>
+        BC3_UNorm_SRgb,
+        /// <summary>
+        /// BC7 block compressed format.
+        /// This is an sRGB format.
+        /// </summary>
+        BC7_UNorm_SRgb,
     }
 }

@@ -23,10 +23,14 @@
       <PackagePath>runtimes/osx-x64/native</PackagePath>
       <Pack>true</Pack>
     </Content>
+    <Content Include="build\net40\Veldrid.SDL2.targets">
+      <PackagePath>build/net40/Veldrid.SDL2.targets</PackagePath>
+      <Pack>true</Pack>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="NativeLibraryLoader" Version="1.0.5" />
+    <PackageReference Include="NativeLibraryLoader" Version="$(NativeLibraryLoaderVersion)" />
     <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="4.4.0" />
     <PackageReference Include="System.Numerics.Vectors" Version="4.4.0" />
   </ItemGroup>

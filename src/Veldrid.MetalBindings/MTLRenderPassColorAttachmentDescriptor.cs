@@ -34,7 +34,17 @@ namespace Veldrid.MetalBindings
 
         public MTLClearColor clearColor
         {
-            get => objc_msgSend_stret<MTLClearColor>(NativePtr, sel_clearColor);
+            get
+            {
+                if (ObjectiveCRuntime.UseStret<MTLClearColor>())
+                {
+                    return objc_msgSend_stret<MTLClearColor>(NativePtr, sel_clearColor);
+                }
+                else
+                {
+                    return MTLClearColor_objc_msgSend(NativePtr,sel_clearColor);
+                }
+            }
             set => objc_msgSend(NativePtr, sel_setClearColor, value);
         }
 
@@ -42,6 +52,12 @@ namespace Veldrid.MetalBindings
         {
             get => UIntPtr_objc_msgSend(NativePtr, Selectors.slice);
             set => objc_msgSend(NativePtr, Selectors.setSlice, value);
+        }
+
+        public UIntPtr level
+        {
+            get => UIntPtr_objc_msgSend(NativePtr, Selectors.level);
+            set => objc_msgSend(NativePtr, Selectors.setLevel, value);
         }
 
         private static readonly Selector sel_clearColor = "clearColor";

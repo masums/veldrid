@@ -1,65 +1,127 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
+using NativeLibraryLoader;
 using Veldrid.MetalBindings;
 
 namespace Veldrid.MTL
 {
     internal unsafe class MTLGraphicsDevice : GraphicsDevice
     {
+        private static readonly Lazy<bool> s_isSupported = new Lazy<bool>(GetIsSupported);
+        private static readonly Dictionary<IntPtr, MTLGraphicsDevice> s_aotRegisteredBlocks
+            = new Dictionary<IntPtr, MTLGraphicsDevice>();
+
         private readonly MTLDevice _device;
-        private CAMetalLayer _metalLayer;
         private readonly MTLCommandQueue _commandQueue;
-        private readonly TextureSampleCount _maxSampleCount;
-        private readonly MTLSwapchainFramebuffer _swapchainFB;
+        private readonly MTLSwapchain _mainSwapchain;
+        private readonly bool[] _supportedSampleCounts;
 
         private readonly object _submittedCommandsLock = new object();
-        private readonly List<(MTLCommandBuffer, MTLFence)> _submittedCBs = new List<(MTLCommandBuffer, MTLFence)>();
+        private readonly Dictionary<MTLCommandBuffer, MTLFence> _submittedCBs = new Dictionary<MTLCommandBuffer, MTLFence>();
+        private MTLCommandBuffer _latestSubmittedCB;
+
+        private readonly object _resetEventsLock = new object();
+        private readonly List<ManualResetEvent[]> _resetEvents = new List<ManualResetEvent[]>();
+
+        private const string UnalignedBufferCopyPipelineMacOSName = "MTL_UnalignedBufferCopy_macOS";
+        private const string UnalignedBufferCopyPipelineiOSName = "MTL_UnalignedBufferCopy_iOS";
+        private readonly object _unalignedBufferCopyPipelineLock = new object();
+        private readonly NativeLibrary _libSystem;
+        private readonly IntPtr _concreteGlobalBlock;
+        private MTLShader _unalignedBufferCopyShader;
+        private MTLComputePipelineState _unalignedBufferCopyPipeline;
+        private MTLCommandBufferHandler _completionHandler;
+        private readonly IntPtr _completionHandlerFuncPtr;
+        private readonly IntPtr _completionBlockDescriptor;
+        private readonly IntPtr _completionBlockLiteral;
 
         public MTLDevice Device => _device;
         public MTLCommandQueue CommandQueue => _commandQueue;
+        public MTLFeatureSupport MetalFeatures { get; }
+        public ResourceBindingModel ResourceBindingModel { get; }
 
         public MTLGraphicsDevice(
             GraphicsDeviceOptions options,
-            IntPtr nsWindow)
+            SwapchainDescription? swapchainDesc)
         {
             _device = MTLDevice.MTLCreateSystemDefaultDevice();
+            MetalFeatures = new MTLFeatureSupport(_device);
+            Features = new GraphicsDeviceFeatures(
+                computeShader: true,
+                geometryShader: false,
+                tessellationShaders: false,
+                multipleViewports: MetalFeatures.IsSupported(MTLFeatureSet.macOS_GPUFamily1_v3),
+                samplerLodBias: false,
+                drawBaseVertex: true,
+                drawBaseInstance: true,
+                drawIndirect: true,
+                drawIndirectBaseInstance: true,
+                fillModeWireframe: true,
+                samplerAnisotropy: true,
+                depthClipDisable: true,
+                texture1D: true, // TODO: Should be macOS 10.11+ and iOS 11.0+.
+                independentBlend: true,
+                structuredBuffer: true,
+                subsetTextureView: true,
+                commandListDebugMarkers: true,
+                bufferRangeBinding: true);
+            ResourceBindingModel = options.ResourceBindingModel;
 
-            NSWindow nswindow = new NSWindow(nsWindow);
-            CGSize windowContentSize = nswindow.contentView.frame.size;
-            uint width = (uint)windowContentSize.width;
-            uint height = (uint)windowContentSize.height;
+            _libSystem = new NativeLibrary("libSystem.dylib");
+            _concreteGlobalBlock = _libSystem.LoadFunction("_NSConcreteGlobalBlock");
+            if (MetalFeatures.IsMacOS)
+            {
+                _completionHandler = OnCommandBufferCompleted;
+            }
+            else
+            {
+                _completionHandler = OnCommandBufferCompleted_Static;
+            }
+            _completionHandlerFuncPtr = Marshal.GetFunctionPointerForDelegate<MTLCommandBufferHandler>(_completionHandler);
+            _completionBlockDescriptor = Marshal.AllocHGlobal(Unsafe.SizeOf<BlockDescriptor>());
+            BlockDescriptor* descriptorPtr = (BlockDescriptor*)_completionBlockDescriptor;
+            descriptorPtr->reserved = 0;
+            descriptorPtr->Block_size = (ulong)Unsafe.SizeOf<BlockDescriptor>();
 
-            var contentView = nswindow.contentView;
-            contentView.wantsLayer = true;
+            _completionBlockLiteral = Marshal.AllocHGlobal(Unsafe.SizeOf<BlockLiteral>());
+            BlockLiteral* blockPtr = (BlockLiteral*)_completionBlockLiteral;
+            blockPtr->isa = _concreteGlobalBlock;
+            blockPtr->flags = 1 << 28 | 1 << 29;
+            blockPtr->invoke = _completionHandlerFuncPtr;
+            blockPtr->descriptor = descriptorPtr;
 
-            _metalLayer = CAMetalLayer.New();
-            contentView.layer = _metalLayer.NativePtr;
-            _metalLayer.device = _device;
-            _metalLayer.pixelFormat = MTLPixelFormat.BGRA8Unorm;
-            _metalLayer.framebufferOnly = true;
+            if (!MetalFeatures.IsMacOS)
+            {
+                lock (s_aotRegisteredBlocks)
+                {
+                    s_aotRegisteredBlocks.Add(_completionBlockLiteral, this);
+                }
+            }
 
             ResourceFactory = new MTLResourceFactory(this);
-            _swapchainFB = new MTLSwapchainFramebuffer(
-                this,
-                _metalLayer,
-                width,
-                height,
-                options.SwapchainDepthFormat,
-                PixelFormat.B8_G8_R8_A8_UNorm);
-
             _commandQueue = _device.newCommandQueue();
-            _swapchainFB.GetNextDrawable();
 
-            foreach (var count in (TextureSampleCount[])Enum.GetValues(typeof(TextureSampleCount)))
+            TextureSampleCount[] allSampleCounts = (TextureSampleCount[])Enum.GetValues(typeof(TextureSampleCount));
+            _supportedSampleCounts = new bool[allSampleCounts.Length];
+            for (int i = 0; i < allSampleCounts.Length; i++)
             {
+                TextureSampleCount count = allSampleCounts[i];
                 uint uintValue = FormatHelpers.GetSampleCountUInt32(count);
                 if (_device.supportsTextureSampleCount((UIntPtr)uintValue))
                 {
-                    _maxSampleCount = count;
+                    _supportedSampleCounts[i] = true;
                 }
+            }
+
+            if (swapchainDesc != null)
+            {
+                SwapchainDescription desc = swapchainDesc.Value;
+                _mainSwapchain = new MTLSwapchain(this, ref desc);
             }
 
             PostDeviceCreated();
@@ -67,73 +129,169 @@ namespace Veldrid.MTL
 
         public override GraphicsBackend BackendType => GraphicsBackend.Metal;
 
+        public override bool IsUvOriginTopLeft => true;
+
+        public override bool IsDepthRangeZeroToOne => true;
+
+        public override bool IsClipSpaceYInverted => false;
+
         public override ResourceFactory ResourceFactory { get; }
 
-        public override bool SyncToVerticalBlank { get; set; }
+        public override Swapchain MainSwapchain => _mainSwapchain;
 
-        public override Framebuffer SwapchainFramebuffer => _swapchainFB;
+        public override GraphicsDeviceFeatures Features { get; }
 
-        protected override void SubmitCommandsCore(CommandList commandList, Fence fence)
+        private void OnCommandBufferCompleted(IntPtr block, MTLCommandBuffer cb)
         {
-
-            MTLCommandList mtlCL = Util.AssertSubtype<CommandList, MTLCommandList>(commandList);
-            MTLCommandBuffer cb = mtlCL.Commit();
             lock (_submittedCommandsLock)
             {
-                CheckSubmittedCommands(assumeCompletion: false);
+                if (_submittedCBs.TryGetValue(cb, out MTLFence fence))
+                {
+                    fence.Set();
+                    _submittedCBs.Remove(cb);
+                }
 
-                MTLFence mtlFence = fence as MTLFence;
-                _submittedCBs.Add((cb, mtlFence));
-                ObjectiveCRuntime.retain(cb.NativePtr);
+                if (_latestSubmittedCB.NativePtr == cb.NativePtr)
+                {
+                    _latestSubmittedCB = default(MTLCommandBuffer);
+                }
+            }
+
+            ObjectiveCRuntime.release(cb.NativePtr);
+        }
+
+        // Xamarin AOT requires native callbacks be static.
+        [MonoPInvokeCallback(typeof(MTLCommandBufferHandler))]
+        private static void OnCommandBufferCompleted_Static(IntPtr block, MTLCommandBuffer cb)
+        {
+            lock (s_aotRegisteredBlocks)
+            {
+                if (s_aotRegisteredBlocks.TryGetValue(block, out MTLGraphicsDevice gd))
+                {
+                    gd.OnCommandBufferCompleted(block, cb);
+                }
             }
         }
 
-        private void CheckSubmittedCommands(bool assumeCompletion)
+        private protected override void SubmitCommandsCore(CommandList commandList, Fence fence)
         {
-            for (int i = 0; i < _submittedCBs.Count; i++)
-            {
-                (MTLCommandBuffer, MTLFence) pair = _submittedCBs[i];
-                if (pair.Item1.status == MTLCommandBufferStatus.Completed)
-                {
-                    if (pair.Item2 != null)
-                    {
-                        pair.Item2.Set();
-                    }
+            MTLCommandList mtlCL = Util.AssertSubtype<CommandList, MTLCommandList>(commandList);
 
-                    ObjectiveCRuntime.release(pair.Item1.NativePtr);
-                    _submittedCBs.RemoveAt(i);
-                    i -= 1;
+            mtlCL.CommandBuffer.addCompletedHandler(_completionBlockLiteral);
+            lock (_submittedCommandsLock)
+            {
+                if (fence != null)
+                {
+                    MTLFence mtlFence = Util.AssertSubtype<Fence, MTLFence>(fence);
+                    _submittedCBs.Add(mtlCL.CommandBuffer, mtlFence);
                 }
+
+                _latestSubmittedCB = mtlCL.Commit();
             }
         }
 
         public override TextureSampleCount GetSampleCountLimit(PixelFormat format, bool depthFormat)
         {
-            return _maxSampleCount;
-        }
-
-        public override void ResizeMainWindow(uint width, uint height)
-        {
-            _swapchainFB.Resize(width, height);
-            _metalLayer.drawableSize = new CGSize(width, height);
-            _swapchainFB.GetNextDrawable();
-        }
-
-        protected override void SwapBuffersCore()
-        {
-            IntPtr currentDrawablePtr = _swapchainFB.CurrentDrawable.NativePtr;
-            if (currentDrawablePtr != IntPtr.Zero)
+            for (int i = _supportedSampleCounts.Length - 1; i >= 0; i--)
             {
-                var submitCB = _commandQueue.commandBuffer();
-                submitCB.presentDrawable(currentDrawablePtr);
-                submitCB.commit();
-                ObjectiveCRuntime.release(submitCB.NativePtr);
+                if (_supportedSampleCounts[i])
+                {
+                    return (TextureSampleCount)i;
+                }
             }
 
-            _swapchainFB.GetNextDrawable();
+            return TextureSampleCount.Count1;
         }
 
-        protected override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
+        private protected override bool GetPixelFormatSupportCore(
+            PixelFormat format,
+            TextureType type,
+            TextureUsage usage,
+            out PixelFormatProperties properties)
+        {
+            if (!MTLFormats.IsFormatSupported(format, usage, MetalFeatures))
+            {
+                properties = default(PixelFormatProperties);
+                return false;
+            }
+
+            uint sampleCounts = 0;
+
+            for (int i = 0; i < _supportedSampleCounts.Length; i++)
+            {
+                if (_supportedSampleCounts[i])
+                {
+                    sampleCounts |= (uint)(1 << i);
+                }
+            }
+
+            MTLFeatureSet maxFeatureSet = MetalFeatures.MaxFeatureSet;
+            uint maxArrayLayer = MTLFormats.GetMaxTextureVolume(maxFeatureSet);
+            uint maxWidth;
+            uint maxHeight;
+            uint maxDepth;
+            if (type == TextureType.Texture1D)
+            {
+                maxWidth = MTLFormats.GetMaxTexture1DWidth(maxFeatureSet);
+                maxHeight = 1;
+                maxDepth = 1;
+            }
+            else if (type == TextureType.Texture2D)
+            {
+                uint maxDimensions;
+                if ((usage & TextureUsage.Cubemap) != 0)
+                {
+                    maxDimensions = MTLFormats.GetMaxTextureCubeDimensions(maxFeatureSet);
+                }
+                else
+                {
+                    maxDimensions = MTLFormats.GetMaxTexture2DDimensions(maxFeatureSet);
+                }
+
+                maxWidth = maxDimensions;
+                maxHeight = maxDimensions;
+                maxDepth = 1;
+            }
+            else if (type == TextureType.Texture3D)
+            {
+                maxWidth = maxArrayLayer;
+                maxHeight = maxArrayLayer;
+                maxDepth = maxArrayLayer;
+                maxArrayLayer = 1;
+            }
+            else
+            {
+                throw Illegal.Value<TextureType>();
+            }
+
+            properties = new PixelFormatProperties(
+                maxWidth,
+                maxHeight,
+                maxDepth,
+                uint.MaxValue,
+                maxArrayLayer,
+                sampleCounts);
+            return true;
+        }
+
+        private protected override void SwapBuffersCore(Swapchain swapchain)
+        {
+            MTLSwapchain mtlSC = Util.AssertSubtype<Swapchain, MTLSwapchain>(swapchain);
+            IntPtr currentDrawablePtr = mtlSC.CurrentDrawable.NativePtr;
+            if (currentDrawablePtr != IntPtr.Zero)
+            {
+                using (NSAutoreleasePool.Begin())
+                {
+                    MTLCommandBuffer submitCB = _commandQueue.commandBuffer();
+                    submitCB.presentDrawable(currentDrawablePtr);
+                    submitCB.commit();
+                }
+            }
+
+            mtlSC.GetNextDrawable();
+        }
+
+        private protected override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
         {
             var mtlBuffer = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(buffer);
             void* destPtr = mtlBuffer.DeviceBuffer.contents();
@@ -141,7 +299,7 @@ namespace Veldrid.MTL
             Unsafe.CopyBlock(destOffsetPtr, source.ToPointer(), sizeInBytes);
         }
 
-        protected override void UpdateTextureCore(
+        private protected override void UpdateTextureCore(
             Texture texture,
             IntPtr source,
             uint sizeInBytes,
@@ -190,18 +348,21 @@ namespace Veldrid.MTL
             }
         }
 
-        protected override void WaitForIdleCore()
+        private protected override void WaitForIdleCore()
         {
+            MTLCommandBuffer lastCB = default(MTLCommandBuffer);
             lock (_submittedCommandsLock)
             {
-                int lastIndex = _submittedCBs.Count - 1;
-                if (lastIndex >= 0)
-                {
-                    (MTLCommandBuffer, MTLFence) lastPair = _submittedCBs[lastIndex];
-                    lastPair.Item1.waitUntilCompleted();
-                    CheckSubmittedCommands(assumeCompletion: true);
-                }
+                lastCB = _latestSubmittedCB;
+                ObjectiveCRuntime.retain(lastCB.NativePtr);
             }
+
+            if (lastCB.NativePtr != IntPtr.Zero && lastCB.status != MTLCommandBufferStatus.Completed)
+            {
+                lastCB.waitUntilCompleted();
+            }
+
+            ObjectiveCRuntime.release(lastCB.NativePtr);
         }
 
         protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
@@ -246,10 +407,23 @@ namespace Veldrid.MTL
         protected override void PlatformDispose()
         {
             WaitForIdle();
-            _swapchainFB.Dispose();
+            if (!_unalignedBufferCopyPipeline.IsNull)
+            {
+                _unalignedBufferCopyShader.Dispose();
+                ObjectiveCRuntime.release(_unalignedBufferCopyPipeline.NativePtr);
+            }
+            _mainSwapchain?.Dispose();
             ObjectiveCRuntime.release(_commandQueue.NativePtr);
-            ObjectiveCRuntime.release(_metalLayer.NativePtr);
             ObjectiveCRuntime.release(_device.NativePtr);
+
+            lock (s_aotRegisteredBlocks)
+            {
+                s_aotRegisteredBlocks.Remove(_completionBlockLiteral);
+            }
+
+            _libSystem.Dispose();
+            Marshal.FreeHGlobal(_completionBlockDescriptor);
+            Marshal.FreeHGlobal(_completionBlockLiteral);
         }
 
         protected override void UnmapCore(MappableResource resource, uint subresource)
@@ -285,9 +459,6 @@ namespace Veldrid.MTL
             return result;
         }
 
-        private readonly object _resetEventsLock = new object();
-        private readonly List<ManualResetEvent[]> _resetEvents = new List<ManualResetEvent[]>();
-
         private ManualResetEvent[] GetResetEventArray(int length)
         {
             lock (_resetEventsLock)
@@ -319,5 +490,82 @@ namespace Veldrid.MTL
         {
             Util.AssertSubtype<Fence, MTLFence>(fence).Reset();
         }
+
+        internal static bool IsSupported() => s_isSupported.Value;
+
+        private static bool GetIsSupported()
+        {
+            bool result = false;
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                {
+                    if (RuntimeInformation.OSDescription.Contains("Darwin"))
+                    {
+                        NSArray allDevices = MTLDevice.MTLCopyAllDevices();
+                        result |= (ulong)allDevices.count > 0;
+                        ObjectiveCRuntime.release(allDevices.NativePtr);
+                    }
+                    else
+                    {
+                        MTLDevice defaultDevice = MTLDevice.MTLCreateSystemDefaultDevice();
+                        if (defaultDevice.NativePtr != IntPtr.Zero)
+                        {
+                            result = true;
+                            ObjectiveCRuntime.release(defaultDevice.NativePtr);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                result = false;
+            }
+
+            return result;
+        }
+
+        internal MTLComputePipelineState GetUnalignedBufferCopyPipeline()
+        {
+            lock (_unalignedBufferCopyPipelineLock)
+            {
+                if (_unalignedBufferCopyPipeline.IsNull)
+                {
+                    MTLComputePipelineDescriptor descriptor = MTLUtil.AllocInit<MTLComputePipelineDescriptor>(
+                       nameof(MTLComputePipelineDescriptor));
+                    MTLPipelineBufferDescriptor buffer0 = descriptor.buffers[0];
+                    buffer0.mutability = MTLMutability.Mutable;
+                    MTLPipelineBufferDescriptor buffer1 = descriptor.buffers[1];
+                    buffer0.mutability = MTLMutability.Mutable;
+
+                    Debug.Assert(_unalignedBufferCopyShader == null);
+                    string name = MetalFeatures.IsMacOS ? UnalignedBufferCopyPipelineMacOSName : UnalignedBufferCopyPipelineiOSName;
+                    using (Stream resourceStream = typeof(MTLGraphicsDevice).Assembly.GetManifestResourceStream(name))
+                    {
+                        byte[] data = new byte[resourceStream.Length];
+                        using (MemoryStream ms = new MemoryStream(data))
+                        {
+                            resourceStream.CopyTo(ms);
+                            ShaderDescription shaderDesc = new ShaderDescription(ShaderStages.Compute, data, "copy_bytes");
+                            _unalignedBufferCopyShader = new MTLShader(ref shaderDesc, this);
+                        }
+                    }
+
+                    descriptor.computeFunction = _unalignedBufferCopyShader.Function;
+                    _unalignedBufferCopyPipeline = _device.newComputePipelineStateWithDescriptor(descriptor);
+                    ObjectiveCRuntime.release(descriptor.NativePtr);
+                }
+
+                return _unalignedBufferCopyPipeline;
+            }
+        }
+
+        internal override uint GetUniformBufferMinOffsetAlignmentCore() => MetalFeatures.IsMacOS ? 16u : 256u;
+        internal override uint GetStructuredBufferMinOffsetAlignmentCore() => 16u;
+    }
+
+    internal sealed class MonoPInvokeCallbackAttribute : Attribute
+    {
+        public MonoPInvokeCallbackAttribute(Type t) { }
     }
 }

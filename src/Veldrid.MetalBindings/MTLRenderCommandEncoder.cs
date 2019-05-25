@@ -46,6 +46,14 @@ namespace Veldrid.MetalBindings
             => objc_msgSend(NativePtr, sel_drawPrimitives0,
                 primitiveType, vertexStart, vertexCount, instanceCount, baseInstance);
 
+        public void drawPrimitives(
+            MTLPrimitiveType primitiveType,
+            UIntPtr vertexStart,
+            UIntPtr vertexCount,
+            UIntPtr instanceCount)
+            => objc_msgSend(NativePtr, sel_drawPrimitives2,
+                primitiveType, vertexStart, vertexCount, instanceCount);
+
         public void drawPrimitives(MTLPrimitiveType primitiveType, MTLBuffer indirectBuffer, UIntPtr indirectBufferOffset)
             => objc_msgSend(NativePtr, sel_drawPrimitives1,
                 primitiveType, indirectBuffer, indirectBufferOffset);
@@ -55,9 +63,10 @@ namespace Veldrid.MetalBindings
             UIntPtr indexCount,
             MTLIndexType indexType,
             MTLBuffer indexBuffer,
-            UIntPtr indexBufferOffset)
+            UIntPtr indexBufferOffset,
+            UIntPtr instanceCount)
             => objc_msgSend(NativePtr, sel_drawIndexedPrimitives0,
-                primitiveType, indexCount, indexType, indexBuffer.NativePtr, indexBufferOffset);
+                primitiveType, indexCount, indexType, indexBuffer.NativePtr, indexBufferOffset, instanceCount);
 
         public void drawIndexedPrimitives(
             MTLPrimitiveType primitiveType,
@@ -88,8 +97,14 @@ namespace Veldrid.MetalBindings
                 indirectBuffer,
                 indirectBufferOffset);
 
+        public unsafe void setViewport(MTLViewport viewport)
+            => objc_msgSend(NativePtr, sel_setViewport, viewport);
+
         public unsafe void setViewports(MTLViewport* viewports, UIntPtr count)
             => objc_msgSend(NativePtr, sel_setViewports, viewports, count);
+
+        public unsafe void setScissorRect(MTLScissorRect scissorRect)
+            => objc_msgSend(NativePtr, sel_setScissorRect, scissorRect);
 
         public unsafe void setScissorRects(MTLScissorRect* scissorRects, UIntPtr count)
             => objc_msgSend(NativePtr, sel_setScissorRects, scissorRects, count);
@@ -114,6 +129,17 @@ namespace Veldrid.MetalBindings
         public void setBlendColor(float red, float green, float blue, float alpha)
             => objc_msgSend(NativePtr, sel_setBlendColor, red, green, blue, alpha);
 
+        public void setTriangleFillMode(MTLTriangleFillMode fillMode)
+            => objc_msgSend(NativePtr, sel_setTriangleFillMode, (uint)fillMode);
+
+        public void pushDebugGroup(NSString @string)
+            => objc_msgSend(NativePtr, Selectors.pushDebugGroup, @string.NativePtr);
+
+        public void popDebugGroup() => objc_msgSend(NativePtr, Selectors.popDebugGroup);
+
+        public void insertDebugSignpost(NSString @string)
+            => objc_msgSend(NativePtr, Selectors.insertDebugSignpost, @string.NativePtr);
+
         private static readonly Selector sel_setRenderPipelineState = "setRenderPipelineState:";
         private static readonly Selector sel_setVertexBuffer = "setVertexBuffer:offset:atIndex:";
         private static readonly Selector sel_setFragmentBuffer = "setFragmentBuffer:offset:atIndex:";
@@ -123,10 +149,13 @@ namespace Veldrid.MetalBindings
         private static readonly Selector sel_setFragmentSamplerState = "setFragmentSamplerState:atIndex:";
         private static readonly Selector sel_drawPrimitives0 = "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:";
         private static readonly Selector sel_drawPrimitives1 = "drawPrimitives:indirectBuffer:indirectBufferOffset:";
-        private static readonly Selector sel_drawIndexedPrimitives0 = "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:";
+        private static readonly Selector sel_drawPrimitives2 = "drawPrimitives:vertexStart:vertexCount:instanceCount:";
+        private static readonly Selector sel_drawIndexedPrimitives0 = "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:";
         private static readonly Selector sel_drawIndexedPrimitives1 = "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:";
         private static readonly Selector sel_drawIndexedPrimitives2 = "drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:";
+        private static readonly Selector sel_setViewport = "setViewport:";
         private static readonly Selector sel_setViewports = "setViewports:count:";
+        private static readonly Selector sel_setScissorRect = "setScissorRect:";
         private static readonly Selector sel_setScissorRects = "setScissorRects:count:";
         private static readonly Selector sel_setCullMode = "setCullMode:";
         private static readonly Selector sel_setFrontFacingWinding = "setFrontFacingWinding:";
@@ -135,5 +164,6 @@ namespace Veldrid.MetalBindings
         private static readonly Selector sel_endEncoding = "endEncoding";
         private static readonly Selector sel_setStencilReferenceValue = "setStencilReferenceValue:";
         private static readonly Selector sel_setBlendColor = "setBlendColorRed:green:blue:alpha:";
+        private static readonly Selector sel_setTriangleFillMode = "setTriangleFillMode:";
     }
 }

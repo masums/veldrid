@@ -2,7 +2,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
-using Veldrid.D3D11;
 
 namespace Veldrid
 {
@@ -58,8 +57,23 @@ namespace Veldrid
             return Encoding.UTF8.GetString(stringStart, characters);
         }
 
+        internal static bool NullableEquals<T>(T? left, T? right) where T : struct, IEquatable<T>
+        {
+            if (left.HasValue && right.HasValue)
+            {
+                return left.Value.Equals(right.Value);
+            }
+
+            return left.HasValue == right.HasValue;
+        }
+
         internal static bool ArrayEquals<T>(T[] left, T[] right) where T : class
         {
+            if (left == null || right == null)
+            {
+                return left == right;
+            }
+
             if (left.Length != right.Length)
             {
                 return false;
@@ -78,6 +92,11 @@ namespace Veldrid
 
         internal static bool ArrayEqualsEquatable<T>(T[] left, T[] right) where T : struct, IEquatable<T>
         {
+            if (left == null || right == null)
+            {
+                return left == right;
+            }
+
             if (left.Length != right.Length)
             {
                 return false;
@@ -233,6 +252,71 @@ namespace Veldrid
                         Unsafe.CopyBlock(rowCopyDst, rowCopySrc, rowSize);
                     }
             }
+        }
+
+        internal static T[] ShallowClone<T>(T[] array)
+        {
+            return (T[])array.Clone();
+        }
+
+        public static DeviceBufferRange GetBufferRange(BindableResource resource, uint additionalOffset)
+        {
+            if (resource is DeviceBufferRange range)
+            {
+                return new DeviceBufferRange(range.Buffer, range.Offset + additionalOffset, range.SizeInBytes);
+            }
+            else
+            {
+                DeviceBuffer buffer = (DeviceBuffer)resource;
+                return new DeviceBufferRange(buffer, additionalOffset, buffer.SizeInBytes);
+            }
+        }
+
+        public static bool GetDeviceBuffer(BindableResource resource, out DeviceBuffer buffer)
+        {
+            if (resource is DeviceBuffer db)
+            {
+                buffer = db;
+                return true;
+            }
+            else if (resource is DeviceBufferRange range)
+            {
+                buffer = range.Buffer;
+                return true;
+            }
+
+            buffer = null;
+            return false;
+        }
+
+        internal static TextureView GetTextureView(GraphicsDevice gd, BindableResource resource)
+        {
+            if (resource is TextureView view)
+            {
+                return view;
+            }
+            else if (resource is Texture tex)
+            {
+                return tex.GetFullTextureView(gd);
+            }
+            else
+            {
+                throw new VeldridException(
+                    $"Unexpected resource type. Expected Texture or TextureView but found {resource.GetType().Name}");
+            }
+        }
+
+        internal static void PackIntPtr(IntPtr sourcePtr, out uint low, out uint high)
+        {
+            ulong src64 = (ulong)sourcePtr;
+            low = (uint)(src64 & 0x00000000FFFFFFFF);
+            high = (uint)((src64 & 0xFFFFFFFF00000000u) >> 32);
+        }
+
+        internal static IntPtr UnpackIntPtr(uint low, uint high)
+        {
+            ulong src64 = low | ((ulong)high << 32);
+            return (IntPtr)src64;
         }
     }
 }

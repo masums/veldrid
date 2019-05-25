@@ -14,26 +14,28 @@ namespace Veldrid.D3D11
         private readonly SharpDX.Direct3D11.Device _device;
         private readonly DeviceContext _immediateContext;
         private readonly D3D11ResourceFactory _d3d11ResourceFactory;
-        private readonly SwapChain _swapChain;
-        private D3D11Framebuffer _swapChainFramebuffer;
+        private readonly D3D11Swapchain _mainSwapchain;
         private readonly bool _supportsConcurrentResources;
         private readonly bool _supportsCommandLists;
         private readonly object _immediateContextLock = new object();
+        private readonly BackendInfoD3D11 _d3d11Info;
 
         private readonly object _mappedResourceLock = new object();
         private readonly Dictionary<MappedResourceCacheKey, MappedResourceInfo> _mappedResources
             = new Dictionary<MappedResourceCacheKey, MappedResourceInfo>();
 
-        private bool _syncToVBlank;
-        private int _syncInterval;
-        private readonly Format? _depthFormat;
-        private readonly float _pixelScale = 1f;
+        private readonly object _stagingResourcesLock = new object();
+        private readonly List<D3D11Buffer> _availableStagingBuffers = new List<D3D11Buffer>();
 
         public override GraphicsBackend BackendType => GraphicsBackend.Direct3D11;
 
-        public override ResourceFactory ResourceFactory => _d3d11ResourceFactory;
+        public override bool IsUvOriginTopLeft => true;
 
-        public override Framebuffer SwapchainFramebuffer => _swapChainFramebuffer;
+        public override bool IsDepthRangeZeroToOne => true;
+
+        public override bool IsClipSpaceYInverted => false;
+
+        public override ResourceFactory ResourceFactory => _d3d11ResourceFactory;
 
         public SharpDX.Direct3D11.Device Device => _device;
 
@@ -41,211 +43,87 @@ namespace Veldrid.D3D11
 
         public bool SupportsCommandLists => _supportsCommandLists;
 
-        public List<D3D11CommandList> CommandListsReferencingSwapchain { get; internal set; } = new List<D3D11CommandList>();
+        public override Swapchain MainSwapchain => _mainSwapchain;
 
-        public override bool SyncToVerticalBlank
-        {
-            get => _syncToVBlank;
-            set
-            {
-                _syncToVBlank = value;
-                _syncInterval = GetSyncInterval(_syncToVBlank);
-            }
-        }
+        public override GraphicsDeviceFeatures Features { get; }
 
-        public D3D11GraphicsDevice(GraphicsDeviceOptions options, IntPtr hwnd, int width, int height)
+        public D3D11GraphicsDevice(GraphicsDeviceOptions options, SwapchainDescription? swapchainDesc)
         {
-            SyncToVerticalBlank = options.SyncToVerticalBlank;
-            _depthFormat = options.SwapchainDepthFormat.HasValue
-                ? D3D11Formats.GetDepthFormat(options.SwapchainDepthFormat.Value)
-                : (Format?)null;
-            SwapChainDescription swapChainDescription = new SwapChainDescription()
-            {
-                BufferCount = 1,
-                IsWindowed = true,
-                ModeDescription = new ModeDescription(width, height, new Rational(60, 1), Format.R8G8B8A8_UNorm),
-                OutputHandle = hwnd,
-                SampleDescription = new SampleDescription(1, 0),
-                SwapEffect = SwapEffect.Discard,
-                Usage = Usage.RenderTargetOutput
-            };
+            DeviceCreationFlags flags = DeviceCreationFlags.None;
+            bool debug = options.Debug;
 #if DEBUG
-            DeviceCreationFlags creationFlags = DeviceCreationFlags.Debug;
-#else
-            DeviceCreationFlags creationFlags = options.Debug ? DeviceCreationFlags.Debug : DeviceCreationFlags.None;
-#endif 
-            SharpDX.Direct3D11.Device.CreateWithSwapChain(
-                SharpDX.Direct3D.DriverType.Hardware,
-                creationFlags,
-                swapChainDescription,
-                out _device,
-                out _swapChain);
+            debug = true;
+#endif
+            if (debug)
+            {
+                flags = DeviceCreationFlags.Debug;
+            }
+
+            try
+            {
+                _device = new SharpDX.Direct3D11.Device(
+                    SharpDX.Direct3D.DriverType.Hardware,
+                    flags,
+                    SharpDX.Direct3D.FeatureLevel.Level_11_1);
+            }
+            catch (SharpDXException)
+            {
+                try
+                {
+                    _device = new SharpDX.Direct3D11.Device(SharpDX.Direct3D.DriverType.Hardware, flags);
+                }
+                catch (SharpDXException ex) when (debug && (uint)ex.HResult == 0x887A002D)
+                {
+                    // The D3D11 debug layer is not installed. Create a normal device without debug support, instead.
+                    _device = new SharpDX.Direct3D11.Device(SharpDX.Direct3D.DriverType.Hardware, DeviceCreationFlags.None);
+                }
+            }
+
+            if (swapchainDesc != null)
+            {
+                SwapchainDescription desc = swapchainDesc.Value;
+                _mainSwapchain = new D3D11Swapchain(_device, ref desc);
+            }
             _immediateContext = _device.ImmediateContext;
             _device.CheckThreadingSupport(out _supportsConcurrentResources, out _supportsCommandLists);
 
-            Factory factory = _swapChain.GetParent<Factory>();
-            factory.MakeWindowAssociation(hwnd, WindowAssociationFlags.IgnoreAll);
-            factory.Dispose();
+            Features = new GraphicsDeviceFeatures(
+                computeShader: true,
+                geometryShader: true,
+                tessellationShaders: true,
+                multipleViewports: true,
+                samplerLodBias: true,
+                drawBaseVertex: true,
+                drawBaseInstance: true,
+                drawIndirect: true,
+                drawIndirectBaseInstance: true,
+                fillModeWireframe: true,
+                samplerAnisotropy: true,
+                depthClipDisable: true,
+                texture1D: true,
+                independentBlend: true,
+                structuredBuffer: true,
+                subsetTextureView: true,
+                commandListDebugMarkers: _device.FeatureLevel >= SharpDX.Direct3D.FeatureLevel.Level_11_1,
+                bufferRangeBinding: _device.FeatureLevel >= SharpDX.Direct3D.FeatureLevel.Level_11_1);
 
             _d3d11ResourceFactory = new D3D11ResourceFactory(this);
-            RecreateSwapchainFramebuffer(width, height);
+            _d3d11Info = new BackendInfoD3D11(this);
 
             PostDeviceCreated();
         }
 
-        public D3D11GraphicsDevice(
-            GraphicsDeviceOptions options,
-            object swapChainPanel,
-            double renderWidth,
-            double renderHeight,
-            float logicalDpi)
-        {
-            SyncToVerticalBlank = options.SyncToVerticalBlank;
-            _depthFormat = options.SwapchainDepthFormat.HasValue
-                ? D3D11Formats.GetDepthFormat(options.SwapchainDepthFormat.Value)
-                : (Format?)null;
-
-#if DEBUG
-            DeviceCreationFlags creationFlags = DeviceCreationFlags.Debug;
-#else
-            DeviceCreationFlags creationFlags = options.Debug ? DeviceCreationFlags.Debug : DeviceCreationFlags.None;
-#endif 
-
-            using (SharpDX.Direct3D11.Device defaultDevice = new SharpDX.Direct3D11.Device(
-                SharpDX.Direct3D.DriverType.Hardware,
-                creationFlags))
-            {
-                _device = defaultDevice.QueryInterface<SharpDX.Direct3D11.Device2>();
-            }
-
-            _pixelScale = logicalDpi / 96.0f;
-
-            int width = (int)(renderWidth * _pixelScale);
-            int height = (int)(renderHeight * _pixelScale);
-
-            // Properties of the swap chain
-            SwapChainDescription1 swapChainDescription = new SwapChainDescription1()
-            {
-                AlphaMode = AlphaMode.Ignore,
-                BufferCount = 2,
-                Format = Format.B8G8R8A8_UNorm,
-                Height = width,
-                Width = height,
-                SampleDescription = new SampleDescription(1, 0),
-                SwapEffect = SwapEffect.FlipSequential,
-                Usage = Usage.BackBuffer | Usage.RenderTargetOutput,
-            };
-
-            // Retrive the SharpDX.DXGI device associated to the Direct3D device.
-            using (SharpDX.DXGI.Device3 dxgiDevice = _device.QueryInterface<SharpDX.DXGI.Device3>())
-            {
-                // Get the SharpDX.DXGI factory automatically created when initializing the Direct3D device.
-                using (Factory2 dxgiFactory = dxgiDevice.Adapter.GetParent<Factory2>())
-                {
-                    // Create the swap chain and get the highest version available.
-                    using (SwapChain1 swapChain1 = new SwapChain1(dxgiFactory, _device, ref swapChainDescription))
-                    {
-                        _swapChain = swapChain1.QueryInterface<SwapChain2>();
-                    }
-                }
-            }
-
-            ComObject co = new ComObject(swapChainPanel);
-
-            ISwapChainPanelNative swapchainPanelNative = co.QueryInterfaceOrNull<ISwapChainPanelNative>();
-            if (swapchainPanelNative != null)
-            {
-                swapchainPanelNative.SwapChain = _swapChain;
-            }
-            else
-            {
-                ISwapChainBackgroundPanelNative bgPanelNative = co.QueryInterfaceOrNull<ISwapChainBackgroundPanelNative>();
-                if (bgPanelNative != null)
-                {
-                    bgPanelNative.SwapChain = _swapChain;
-                }
-            }
-
-            _immediateContext = _device.ImmediateContext;
-            _device.CheckThreadingSupport(out _supportsConcurrentResources, out _supportsCommandLists);
-
-            _d3d11ResourceFactory = new D3D11ResourceFactory(this);
-            RecreateSwapchainFramebuffer(width, height);
-
-            PostDeviceCreated();
-        }
-
-        public override void ResizeMainWindow(uint width, uint height)
-        {
-            RecreateSwapchainFramebuffer((int)width, (int)height);
-        }
-
-        private void RecreateSwapchainFramebuffer(int width, int height)
-        {
-            // NOTE: Perhaps this should be deferred until all CommandLists naturally remove their references to the swapchain.
-            // The actual resize could be done in ExecuteCommands() when it is found that this list is empty.
-            foreach (D3D11CommandList d3dCL in CommandListsReferencingSwapchain)
-            {
-                d3dCL.Reset();
-            }
-
-            if (_swapChainFramebuffer != null)
-            {
-                if (_swapChainFramebuffer.DepthTarget.HasValue)
-                {
-                    _swapChainFramebuffer.DepthTarget.Value.Target.Dispose();
-                }
-                _swapChainFramebuffer.Dispose();
-            }
-
-
-            int actualWidth = (int)(width * _pixelScale);
-            int actualHeight = (int)(height * _pixelScale);
-            _swapChain.ResizeBuffers(2, actualWidth, actualHeight, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
-
-            // Get the backbuffer from the swapchain
-            using (Texture2D backBufferTexture = _swapChain.GetBackBuffer<Texture2D>(0))
-            {
-                Texture2D depthBufferTexture = null;
-                if (_depthFormat != null)
-                {
-                    depthBufferTexture = new Texture2D(
-                        _device,
-                        new Texture2DDescription()
-                        {
-                            Format = _depthFormat.Value,
-                            ArraySize = 1,
-                            MipLevels = 1,
-                            Width = backBufferTexture.Description.Width,
-                            Height = backBufferTexture.Description.Height,
-                            SampleDescription = new SampleDescription(1, 0),
-                            Usage = ResourceUsage.Default,
-                            BindFlags = BindFlags.DepthStencil,
-                            CpuAccessFlags = CpuAccessFlags.None,
-                            OptionFlags = ResourceOptionFlags.None
-                        });
-                }
-
-                D3D11Texture backBufferVdTexture = new D3D11Texture(backBufferTexture);
-                D3D11Texture depthVdTexture = depthBufferTexture != null
-                    ? new D3D11Texture(depthBufferTexture)
-                    : null;
-                FramebufferDescription desc = new FramebufferDescription(depthVdTexture, backBufferVdTexture);
-                _swapChainFramebuffer = new D3D11Framebuffer(_device, ref desc);
-                _swapChainFramebuffer.IsSwapchainFramebuffer = true;
-            }
-        }
-
-        protected override void SubmitCommandsCore(CommandList cl, Fence fence)
+        private protected override void SubmitCommandsCore(CommandList cl, Fence fence)
         {
             D3D11CommandList d3d11CL = Util.AssertSubtype<CommandList, D3D11CommandList>(cl);
             lock (_immediateContextLock)
             {
-                _immediateContext.ExecuteCommandList(d3d11CL.DeviceCommandList, false);
+                if (d3d11CL.DeviceCommandList != null) // CommandList may have been reset in the meantime (resized swapchain).
+                {
+                    _immediateContext.ExecuteCommandList(d3d11CL.DeviceCommandList, false);
+                    d3d11CL.OnCompleted();
+                }
             }
-            d3d11CL.DeviceCommandList.Dispose();
-            d3d11CL.DeviceCommandList = null;
-            CommandListsReferencingSwapchain.Remove(d3d11CL);
 
             if (fence is D3D11Fence d3d11Fence)
             {
@@ -253,31 +131,35 @@ namespace Veldrid.D3D11
             }
         }
 
-        protected override void SwapBuffersCore()
+        private protected override void SwapBuffersCore(Swapchain swapchain)
         {
-            _swapChain.Present(_syncInterval, PresentFlags.None);
+            lock (_immediateContextLock)
+            {
+                D3D11Swapchain d3d11SC = Util.AssertSubtype<Swapchain, D3D11Swapchain>(swapchain);
+                d3d11SC.DxgiSwapChain.Present(d3d11SC.SyncInterval, PresentFlags.None);
+            }
         }
 
         public override TextureSampleCount GetSampleCountLimit(PixelFormat format, bool depthFormat)
         {
             Format dxgiFormat = D3D11Formats.ToDxgiFormat(format, depthFormat);
-            if (CheckFormat(dxgiFormat, 32))
+            if (CheckFormatMultisample(dxgiFormat, 32))
             {
                 return TextureSampleCount.Count32;
             }
-            else if (CheckFormat(dxgiFormat, 16))
+            else if (CheckFormatMultisample(dxgiFormat, 16))
             {
                 return TextureSampleCount.Count16;
             }
-            else if (CheckFormat(dxgiFormat, 8))
+            else if (CheckFormatMultisample(dxgiFormat, 8))
             {
                 return TextureSampleCount.Count8;
             }
-            else if (CheckFormat(dxgiFormat, 4))
+            else if (CheckFormatMultisample(dxgiFormat, 4))
             {
                 return TextureSampleCount.Count4;
             }
-            else if (CheckFormat(dxgiFormat, 2))
+            else if (CheckFormatMultisample(dxgiFormat, 2))
             {
                 return TextureSampleCount.Count2;
             }
@@ -285,9 +167,55 @@ namespace Veldrid.D3D11
             return TextureSampleCount.Count1;
         }
 
-        private bool CheckFormat(Format format, int sampleCount)
+        private bool CheckFormatMultisample(Format format, int sampleCount)
         {
             return _device.CheckMultisampleQualityLevels(format, sampleCount) != 0;
+        }
+
+        private protected override bool GetPixelFormatSupportCore(
+            PixelFormat format,
+            TextureType type,
+            TextureUsage usage,
+            out PixelFormatProperties properties)
+        {
+            if (D3D11Formats.IsUnsupportedFormat(format))
+            {
+                properties = default(PixelFormatProperties);
+                return false;
+            }
+
+            Format dxgiFormat = D3D11Formats.ToDxgiFormat(format, (usage & TextureUsage.DepthStencil) != 0);
+            FormatSupport fs = _device.CheckFormatSupport(dxgiFormat);
+
+            if ((usage & TextureUsage.RenderTarget) != 0 && (fs & FormatSupport.RenderTarget) == 0
+                || (usage & TextureUsage.DepthStencil) != 0 && (fs & FormatSupport.DepthStencil) == 0
+                || (usage & TextureUsage.Sampled) != 0 && (fs & FormatSupport.ShaderSample) == 0
+                || (usage & TextureUsage.Cubemap) != 0 && (fs & FormatSupport.TextureCube) == 0
+                || (usage & TextureUsage.Storage) != 0 && (fs & FormatSupport.TypedUnorderedAccessView) == 0)
+            {
+                properties = default(PixelFormatProperties);
+                return false;
+            }
+
+            const uint MaxTextureDimension = 16384;
+            const uint MaxVolumeExtent = 2048;
+
+            uint sampleCounts = 0;
+            if (CheckFormatMultisample(dxgiFormat, 1)) { sampleCounts |= (1 << 0); }
+            if (CheckFormatMultisample(dxgiFormat, 2)) { sampleCounts |= (1 << 1); }
+            if (CheckFormatMultisample(dxgiFormat, 4)) { sampleCounts |= (1 << 2); }
+            if (CheckFormatMultisample(dxgiFormat, 8)) { sampleCounts |= (1 << 3); }
+            if (CheckFormatMultisample(dxgiFormat, 16)) { sampleCounts |= (1 << 4); }
+            if (CheckFormatMultisample(dxgiFormat, 32)) { sampleCounts |= (1 << 5); }
+
+            properties = new PixelFormatProperties(
+                MaxTextureDimension,
+                type == TextureType.Texture1D ? 1 : MaxTextureDimension,
+                type != TextureType.Texture3D ? 1 : MaxVolumeExtent,
+                uint.MaxValue,
+                type == TextureType.Texture3D ? 1 : MaxVolumeExtent,
+                sampleCounts);
+            return true;
         }
 
         protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
@@ -317,8 +245,7 @@ namespace Veldrid.D3D11
                                 buffer.Buffer,
                                 0,
                                 D3D11Formats.VdToD3D11MapMode((buffer.Usage & BufferUsage.Dynamic) == BufferUsage.Dynamic, mode),
-                                SharpDX.Direct3D11.MapFlags.None,
-                                out DataStream ds);
+                                SharpDX.Direct3D11.MapFlags.None);
 
                             info.MappedResource = new MappedResource(resource, mode, db.DataPointer, buffer.SizeInBytes);
                             info.RefCount = 1;
@@ -392,7 +319,7 @@ namespace Veldrid.D3D11
             }
         }
 
-        protected unsafe override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
+        private protected unsafe override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
         {
             D3D11Buffer d3dBuffer = Util.AssertSubtype<DeviceBuffer, D3D11Buffer>(buffer);
             if (sizeInBytes == 0)
@@ -400,51 +327,91 @@ namespace Veldrid.D3D11
                 return;
             }
 
-            bool useMap = (buffer.Usage & BufferUsage.Dynamic) == BufferUsage.Dynamic
-                || (buffer.Usage & BufferUsage.Staging) == BufferUsage.Staging;
+            bool isDynamic = (buffer.Usage & BufferUsage.Dynamic) == BufferUsage.Dynamic;
+            bool isStaging = (buffer.Usage & BufferUsage.Staging) == BufferUsage.Staging;
+            bool isUniformBuffer = (buffer.Usage & BufferUsage.UniformBuffer) == BufferUsage.UniformBuffer;
+            bool updateFullBuffer = bufferOffsetInBytes == 0 && sizeInBytes == buffer.SizeInBytes;
+            bool useUpdateSubresource = (!isDynamic && !isStaging) && (!isUniformBuffer || updateFullBuffer);
+            bool useMap = (isDynamic && updateFullBuffer) || isStaging;
 
-            if (useMap)
+            if (useUpdateSubresource)
             {
-                if (bufferOffsetInBytes != 0)
+                ResourceRegion? subregion = new ResourceRegion()
                 {
-                    throw new NotImplementedException("bufferOffsetInBytes must be 0 for Dynamic Buffers.");
+                    Left = (int)bufferOffsetInBytes,
+                    Right = (int)(sizeInBytes + bufferOffsetInBytes),
+                    Bottom = 1,
+                    Back = 1
+                };
+
+                if (isUniformBuffer)
+                {
+                    subregion = null;
                 }
 
-                MappedResource mr = MapCore(buffer, MapMode.Write, 0);
-                if (sizeInBytes < 1024)
-                {
-                    Unsafe.CopyBlock(mr.Data.ToPointer(), source.ToPointer(), sizeInBytes);
-                }
-                else
-                {
-                    System.Buffer.MemoryCopy(source.ToPointer(), mr.Data.ToPointer(), buffer.SizeInBytes, sizeInBytes);
-                }
-                UnmapCore(buffer, 0);
-            }
-            else
-            {
-                ResourceRegion? subregion = null;
-                if ((d3dBuffer.Buffer.Description.BindFlags & BindFlags.ConstantBuffer) != BindFlags.ConstantBuffer)
-                {
-                    // For a shader-constant buffer; set pDstBox to null. It is not possible to use
-                    // this method to partially update a shader-constant buffer
-
-                    subregion = new ResourceRegion()
-                    {
-                        Left = (int)bufferOffsetInBytes,
-                        Right = (int)(sizeInBytes + bufferOffsetInBytes),
-                        Bottom = 1,
-                        Back = 1
-                    };
-                }
                 lock (_immediateContextLock)
                 {
                     _immediateContext.UpdateSubresource(d3dBuffer.Buffer, 0, subregion, source, 0, 0);
                 }
             }
+            else if (useMap)
+            {
+                MappedResource mr = MapCore(buffer, MapMode.Write, 0);
+                if (sizeInBytes < 1024)
+                {
+                    Unsafe.CopyBlock((byte*)mr.Data + bufferOffsetInBytes, source.ToPointer(), sizeInBytes);
+                }
+                else
+                {
+                    System.Buffer.MemoryCopy(
+                        source.ToPointer(),
+                        (byte*)mr.Data + bufferOffsetInBytes,
+                        buffer.SizeInBytes,
+                        sizeInBytes);
+                }
+                UnmapCore(buffer, 0);
+            }
+            else
+            {
+                D3D11Buffer staging = GetFreeStagingBuffer(sizeInBytes);
+                UpdateBuffer(staging, 0, source, sizeInBytes);
+                ResourceRegion sourceRegion = new ResourceRegion(0, 0, 0, (int)sizeInBytes, 1, 1);
+                lock (_immediateContextLock)
+                {
+                    _immediateContext.CopySubresourceRegion(
+                        staging.Buffer, 0, sourceRegion,
+                        d3dBuffer.Buffer, 0,
+                        (int)bufferOffsetInBytes, 0, 0);
+                }
+
+                lock (_stagingResourcesLock)
+                {
+                    _availableStagingBuffers.Add(staging);
+                }
+            }
         }
 
-        protected unsafe override void UpdateTextureCore(
+        private D3D11Buffer GetFreeStagingBuffer(uint sizeInBytes)
+        {
+            lock (_stagingResourcesLock)
+            {
+                foreach (D3D11Buffer buffer in _availableStagingBuffers)
+                {
+                    if (buffer.SizeInBytes >= sizeInBytes)
+                    {
+                        _availableStagingBuffers.Remove(buffer);
+                        return buffer;
+                    }
+                }
+            }
+
+            DeviceBuffer staging = ResourceFactory.CreateBuffer(
+                new BufferDescription(sizeInBytes, BufferUsage.Staging));
+
+            return Util.AssertSubtype<DeviceBuffer, D3D11Buffer>(staging);
+        }
+
+        private protected unsafe override void UpdateTextureCore(
             Texture texture,
             IntPtr source,
             uint sizeInBytes,
@@ -490,8 +457,9 @@ namespace Veldrid.D3D11
                     front: (int)z,
                     bottom: (int)(y + height),
                     back: (int)(z + depth));
-                uint srcRowPitch = FormatHelpers.GetSizeInBytes(texture.Format) * width;
-                uint srcDepthPitch = srcRowPitch * depth;
+
+                uint srcRowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
+                uint srcDepthPitch = FormatHelpers.GetDepthPitch(srcRowPitch, height, texture.Format);
                 lock (_immediateContextLock)
                 {
                     _immediateContext.UpdateSubresource(
@@ -569,6 +537,10 @@ namespace Veldrid.D3D11
             Util.AssertSubtype<Fence, D3D11Fence>(fence).Reset();
         }
 
+        internal override uint GetUniformBufferMinOffsetAlignmentCore() => 256u;
+
+        internal override uint GetStructuredBufferMinOffsetAlignmentCore() => 16;
+
         private static int GetSyncInterval(bool syncToVBlank)
         {
             return syncToVBlank ? 1 : 0;
@@ -577,12 +549,7 @@ namespace Veldrid.D3D11
         protected override void PlatformDispose()
         {
             _d3d11ResourceFactory.Dispose();
-            if (_swapChainFramebuffer.DepthTarget.HasValue)
-            {
-                _swapChainFramebuffer.DepthTarget.Value.Target.Dispose();
-            }
-            _swapChainFramebuffer.Dispose();
-            _swapChain.Dispose();
+            _mainSwapchain?.Dispose();
             _immediateContext.Dispose();
 
             DeviceDebug deviceDebug = _device.QueryInterfaceOrNull<DeviceDebug>();
@@ -597,8 +564,14 @@ namespace Veldrid.D3D11
             }
         }
 
-        protected override void WaitForIdleCore()
+        private protected override void WaitForIdleCore()
         {
+        }
+
+        public override bool GetD3D11Info(out BackendInfoD3D11 info)
+        {
+            info = _d3d11Info;
+            return true;
         }
     }
 }

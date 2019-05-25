@@ -7,6 +7,7 @@ namespace Veldrid.Vk
 {
     internal unsafe static class VulkanUtil
     {
+        private static Lazy<bool> s_isVulkanLoaded = new Lazy<bool>(TryLoadVulkan);
         private static readonly Lazy<string[]> s_instanceExtensions = new Lazy<string[]>(EnumerateInstanceExtensions);
 
         [Conditional("DEBUG")]
@@ -30,51 +31,6 @@ namespace Veldrid.Vk
             }
 
             throw new VeldridException("No suitable memory type.");
-        }
-
-        public static void CreateImage(
-            VkDevice device,
-            VkPhysicalDeviceMemoryProperties physicalDeviceMemProperties,
-            VkDeviceMemoryManager memoryManager,
-            uint width,
-            uint height,
-            uint depth,
-            uint arrayLayers,
-            VkFormat format,
-            VkImageTiling tiling,
-            VkImageUsageFlags usage,
-            VkMemoryPropertyFlags properties,
-            out VkImage image,
-            out VkMemoryBlock memory)
-        {
-            VkImageCreateInfo imageCI = VkImageCreateInfo.New();
-            imageCI.imageType = VkImageType.Image2D;
-            imageCI.extent.width = width;
-            imageCI.extent.height = height;
-            imageCI.extent.depth = depth;
-            imageCI.mipLevels = 1;
-            imageCI.arrayLayers = arrayLayers;
-            imageCI.format = format;
-            imageCI.tiling = tiling;
-            imageCI.initialLayout = VkImageLayout.Preinitialized;
-            imageCI.usage = usage;
-            imageCI.sharingMode = VkSharingMode.Exclusive;
-            imageCI.samples = VkSampleCountFlags.Count1;
-
-            VkResult result = vkCreateImage(device, ref imageCI, null, out image);
-            CheckResult(result);
-
-            vkGetImageMemoryRequirements(device, image, out VkMemoryRequirements memRequirements);
-            VkMemoryBlock memoryToken = memoryManager.Allocate(
-                physicalDeviceMemProperties,
-                memRequirements.memoryTypeBits,
-                properties,
-                false,
-                memRequirements.size,
-                memRequirements.alignment);
-            memory = memoryToken;
-            result = vkBindImageMemory(device, image, memory.DeviceMemory, memory.Offset);
-            CheckResult(result);
         }
 
         public static string[] EnumerateInstanceLayers()
@@ -113,7 +69,11 @@ namespace Veldrid.Vk
 
             uint propCount = 0;
             VkResult result = vkEnumerateInstanceExtensionProperties((byte*)null, ref propCount, null);
-            CheckResult(result);
+            if (result != VkResult.Success)
+            {
+                return Array.Empty<string>();
+            }
+
             if (propCount == 0)
             {
                 return Array.Empty<string>();
@@ -134,7 +94,8 @@ namespace Veldrid.Vk
             return ret;
         }
 
-        public static bool IsVulkanLoaded()
+        public static bool IsVulkanLoaded() => s_isVulkanLoaded.Value;
+        private static bool TryLoadVulkan()
         {
             try
             {
@@ -200,6 +161,42 @@ namespace Veldrid.Vk
                 srcStageFlags = VkPipelineStageFlags.TopOfPipe;
                 dstStageFlags = VkPipelineStageFlags.Transfer;
             }
+            else if (oldLayout == VkImageLayout.Preinitialized && newLayout == VkImageLayout.General)
+            {
+                barrier.srcAccessMask = VkAccessFlags.None;
+                barrier.dstAccessMask = VkAccessFlags.ShaderRead;
+                srcStageFlags = VkPipelineStageFlags.TopOfPipe;
+                dstStageFlags = VkPipelineStageFlags.ComputeShader;
+            }
+            else if (oldLayout == VkImageLayout.Preinitialized && newLayout == VkImageLayout.ShaderReadOnlyOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.None;
+                barrier.dstAccessMask = VkAccessFlags.ShaderRead;
+                srcStageFlags = VkPipelineStageFlags.TopOfPipe;
+                dstStageFlags = VkPipelineStageFlags.FragmentShader;
+            }
+            else if (oldLayout == VkImageLayout.General && newLayout == VkImageLayout.ShaderReadOnlyOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.TransferRead;
+                barrier.dstAccessMask = VkAccessFlags.ShaderRead;
+                srcStageFlags = VkPipelineStageFlags.Transfer;
+                dstStageFlags = VkPipelineStageFlags.FragmentShader;
+            }
+            else if (oldLayout == VkImageLayout.ShaderReadOnlyOptimal && newLayout == VkImageLayout.General)
+            {
+                barrier.srcAccessMask = VkAccessFlags.ShaderRead;
+                barrier.dstAccessMask = VkAccessFlags.ShaderRead;
+                srcStageFlags = VkPipelineStageFlags.FragmentShader;
+                dstStageFlags = VkPipelineStageFlags.ComputeShader;
+            }
+
+            else if (oldLayout == VkImageLayout.TransferSrcOptimal && newLayout == VkImageLayout.ShaderReadOnlyOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.TransferRead;
+                barrier.dstAccessMask = VkAccessFlags.ShaderRead;
+                srcStageFlags = VkPipelineStageFlags.Transfer;
+                dstStageFlags = VkPipelineStageFlags.FragmentShader;
+            }
             else if (oldLayout == VkImageLayout.TransferDstOptimal && newLayout == VkImageLayout.ShaderReadOnlyOptimal)
             {
                 barrier.srcAccessMask = VkAccessFlags.TransferWrite;
@@ -227,6 +224,48 @@ namespace Veldrid.Vk
                 barrier.dstAccessMask = VkAccessFlags.TransferRead;
                 srcStageFlags = VkPipelineStageFlags.ColorAttachmentOutput;
                 dstStageFlags = VkPipelineStageFlags.Transfer;
+            }
+            else if (oldLayout == VkImageLayout.ColorAttachmentOptimal && newLayout == VkImageLayout.TransferDstOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.ColorAttachmentWrite;
+                barrier.dstAccessMask = VkAccessFlags.TransferWrite;
+                srcStageFlags = VkPipelineStageFlags.ColorAttachmentOutput;
+                dstStageFlags = VkPipelineStageFlags.Transfer;
+            }
+            else if (oldLayout == VkImageLayout.ColorAttachmentOptimal && newLayout == VkImageLayout.ShaderReadOnlyOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.ColorAttachmentWrite;
+                barrier.dstAccessMask = VkAccessFlags.ShaderRead;
+                srcStageFlags = VkPipelineStageFlags.ColorAttachmentOutput;
+                dstStageFlags = VkPipelineStageFlags.FragmentShader;
+            }
+            else if (oldLayout == VkImageLayout.DepthStencilAttachmentOptimal && newLayout == VkImageLayout.ShaderReadOnlyOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.DepthStencilAttachmentWrite;
+                barrier.dstAccessMask = VkAccessFlags.ShaderRead;
+                srcStageFlags = VkPipelineStageFlags.LateFragmentTests;
+                dstStageFlags = VkPipelineStageFlags.FragmentShader;
+            }
+            else if (oldLayout == VkImageLayout.ColorAttachmentOptimal && newLayout == VkImageLayout.PresentSrcKHR)
+            {
+                barrier.srcAccessMask = VkAccessFlags.ColorAttachmentWrite;
+                barrier.dstAccessMask = VkAccessFlags.MemoryRead;
+                srcStageFlags = VkPipelineStageFlags.ColorAttachmentOutput;
+                dstStageFlags = VkPipelineStageFlags.BottomOfPipe;
+            }
+            else if (oldLayout == VkImageLayout.TransferDstOptimal && newLayout == VkImageLayout.ColorAttachmentOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.TransferWrite;
+                barrier.dstAccessMask = VkAccessFlags.ColorAttachmentWrite;
+                srcStageFlags = VkPipelineStageFlags.Transfer;
+                dstStageFlags = VkPipelineStageFlags.ColorAttachmentOutput;
+            }
+            else if (oldLayout == VkImageLayout.TransferDstOptimal && newLayout == VkImageLayout.DepthStencilAttachmentOptimal)
+            {
+                barrier.srcAccessMask = VkAccessFlags.TransferWrite;
+                barrier.dstAccessMask = VkAccessFlags.DepthStencilAttachmentWrite;
+                srcStageFlags = VkPipelineStageFlags.Transfer;
+                dstStageFlags = VkPipelineStageFlags.LateFragmentTests;
             }
             else
             {

@@ -26,13 +26,18 @@ namespace Veldrid.MTL
 
         public override string Name { get; set; }
 
+        public MTLPlaceholderTexture(PixelFormat format)
+        {
+            Format = format;
+        }
+
         public void Resize(uint width, uint height)
         {
             _width = width;
             _height = height;
         }
 
-        public override void Dispose()
+        private protected override void DisposeCore()
         {
         }
     }

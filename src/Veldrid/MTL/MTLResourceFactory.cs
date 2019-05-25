@@ -7,6 +7,7 @@ namespace Veldrid.MTL
         private readonly MTLGraphicsDevice _gd;
 
         public MTLResourceFactory(MTLGraphicsDevice gd)
+            : base(gd.Features)
         {
             _gd = gd;
         }
@@ -28,7 +29,7 @@ namespace Veldrid.MTL
             return new MTLFramebuffer(_gd, ref description);
         }
 
-        public override Pipeline CreateGraphicsPipeline(ref GraphicsPipelineDescription description)
+        protected override Pipeline CreateGraphicsPipelineCore(ref GraphicsPipelineDescription description)
         {
             return new MTLPipeline(ref description, _gd);
         }
@@ -40,15 +41,16 @@ namespace Veldrid.MTL
 
         public override ResourceSet CreateResourceSet(ref ResourceSetDescription description)
         {
+            ValidationHelpers.ValidateResourceSet(_gd, ref description);
             return new MTLResourceSet(ref description, _gd);
         }
 
-        public override Sampler CreateSampler(ref SamplerDescription description)
+        protected override Sampler CreateSamplerCore(ref SamplerDescription description)
         {
             return new MTLSampler(ref description, _gd);
         }
 
-        public override Shader CreateShader(ref ShaderDescription description)
+        protected override Shader CreateShaderCore(ref ShaderDescription description)
         {
             return new MTLShader(ref description, _gd);
         }
@@ -63,6 +65,11 @@ namespace Veldrid.MTL
             return new MTLTexture(ref description, _gd);
         }
 
+        protected override Texture CreateTextureCore(ulong nativeTexture, ref TextureDescription description)
+        {
+            return new MTLTexture(nativeTexture, ref description);
+        }
+
         protected override TextureView CreateTextureViewCore(ref TextureViewDescription description)
         {
             return new MTLTextureView(ref description, _gd);
@@ -71,6 +78,11 @@ namespace Veldrid.MTL
         public override Fence CreateFence(bool signaled)
         {
             return new MTLFence(signaled);
+        }
+
+        public override Swapchain CreateSwapchain(ref SwapchainDescription description)
+        {
+            return new MTLSwapchain(_gd, ref description);
         }
     }
 }

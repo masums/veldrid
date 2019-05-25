@@ -1,4 +1,5 @@
-﻿using Xunit;
+﻿using System;
+using Xunit;
 
 namespace Veldrid.Tests
 {
@@ -84,6 +85,58 @@ namespace Veldrid.Tests
         }
 
         [Fact]
+        public void NonZeroMipLevel_ClearColor_Succeeds()
+        {
+            Texture testTex = RF.CreateTexture(
+                TextureDescription.Texture2D(1024, 1024, 11, 1, PixelFormat.R32_G32_B32_A32_Float, TextureUsage.RenderTarget));
+
+            Framebuffer[] framebuffers = new Framebuffer[11];
+            for (uint level = 0; level < 11; level++)
+            {
+                framebuffers[level] = RF.CreateFramebuffer(
+                    new FramebufferDescription(null, new[] { new FramebufferAttachmentDescription(testTex, 0, level) }));
+            }
+
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+            for (uint level = 0; level < 11; level++)
+            {
+                cl.SetFramebuffer(framebuffers[level]);
+                cl.ClearColorTarget(0, new RgbaFloat(level, level, level, 1));
+            }
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            Texture readback = RF.CreateTexture(
+                TextureDescription.Texture2D(1024, 1024, 11, 1, PixelFormat.R32_G32_B32_A32_Float, TextureUsage.Staging));
+            cl.Begin();
+            cl.CopyTexture(testTex, readback);
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            uint mipWidth = 1024;
+            uint mipHeight = 1024;
+            for (uint level = 0; level < 11; level++)
+            {
+                MappedResourceView<RgbaFloat> readView = GD.Map<RgbaFloat>(readback, MapMode.Read, level);
+                for (uint y = 0; y < mipHeight; y++)
+                    for (uint x = 0; x < mipWidth; x++)
+                    {
+                        Assert.Equal(new RgbaFloat(level, level, level, 1), readView[x, y]);
+                    }
+
+                GD.Unmap(readback, level);
+                mipWidth = Math.Max(1, mipWidth / 2);
+                mipHeight = Math.Max(1, mipHeight / 2);
+            }
+        }
+    }
+
+    public abstract class SwapchainFramebufferTests<T> : GraphicsDeviceTestBase<T> where T : GraphicsDeviceCreator
+    {
+        [Fact]
         public void ClearSwapchainFramebuffer_Succeeds()
         {
             CommandList cl = RF.CreateCommandList();
@@ -95,14 +148,24 @@ namespace Veldrid.Tests
         }
     }
 
+#if TEST_OPENGL
     public class OpenGLFramebufferTests : FramebufferTests<OpenGLDeviceCreator> { }
+    public class OpenGLSwapchainFramebufferTests : SwapchainFramebufferTests<OpenGLDeviceCreator> { }
+#endif
+#if TEST_OPENGLES
+    public class OpenGLESFramebufferTests : FramebufferTests<OpenGLESDeviceCreator> { }
+    public class OpenGLESSwapchainFramebufferTests : SwapchainFramebufferTests<OpenGLESDeviceCreator> { }
+#endif
 #if TEST_VULKAN
     public class VulkanFramebufferTests : FramebufferTests<VulkanDeviceCreator> { }
+    public class VulkanSwapchainFramebufferTests : SwapchainFramebufferTests<VulkanDeviceCreatorWithMainSwapchain> { }
 #endif
 #if TEST_D3D11
     public class D3D11FramebufferTests : FramebufferTests<D3D11DeviceCreator> { }
+    public class D3D11SwapchainFramebufferTests : SwapchainFramebufferTests<D3D11DeviceCreatorWithMainSwapchain> { }
 #endif
 #if TEST_METAL
     public class MetalFramebufferTests : FramebufferTests<MetalDeviceCreator> { }
+    public class MetalSwapchainFramebufferTests : SwapchainFramebufferTests<MetalDeviceCreatorWithMainSwapchain> { }
 #endif
 }

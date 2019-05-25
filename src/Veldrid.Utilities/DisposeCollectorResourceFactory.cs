@@ -11,6 +11,7 @@ namespace Veldrid.Utilities
         }
 
         public DisposeCollectorResourceFactory(ResourceFactory factory, DisposeCollector disposeCollector)
+            : base(factory.Features)
         {
             Factory = factory;
             DisposeCollector = disposeCollector;
@@ -39,7 +40,7 @@ namespace Veldrid.Utilities
             return buffer;
         }
 
-        public override Pipeline CreateGraphicsPipeline(ref GraphicsPipelineDescription description)
+        protected override Pipeline CreateGraphicsPipelineCore(ref GraphicsPipelineDescription description)
         {
             Pipeline pipeline = Factory.CreateGraphicsPipeline(ref description);
             DisposeCollector.Add(pipeline);
@@ -67,14 +68,14 @@ namespace Veldrid.Utilities
             return rs;
         }
 
-        public override Sampler CreateSampler(ref SamplerDescription description)
+        protected override Sampler CreateSamplerCore(ref SamplerDescription description)
         {
             Sampler sampler = Factory.CreateSampler(ref description);
             DisposeCollector.Add(sampler);
             return sampler;
         }
 
-        public override Shader CreateShader(ref ShaderDescription description)
+        protected override Shader CreateShaderCore(ref ShaderDescription description)
         {
             Shader shader = Factory.CreateShader(ref description);
             DisposeCollector.Add(shader);
@@ -100,6 +101,20 @@ namespace Veldrid.Utilities
             Fence f = Factory.CreateFence(signaled);
             DisposeCollector.Add(f);
             return f;
+        }
+
+        public override Swapchain CreateSwapchain(ref SwapchainDescription description)
+        {
+            Swapchain sc = Factory.CreateSwapchain(ref description);
+            DisposeCollector.Add(sc);
+            return sc;
+        }
+
+        protected override Texture CreateTextureCore(ulong nativeTexture, ref TextureDescription description)
+        {
+            Texture tex = Factory.CreateTexture(nativeTexture, ref description);
+            DisposeCollector.Add(tex);
+            return tex;
         }
     }
 }

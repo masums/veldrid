@@ -10,22 +10,11 @@ namespace Veldrid.MTL
         public MTLFramebuffer(MTLGraphicsDevice gd, ref FramebufferDescription description)
             : base(gd, ref description)
         {
-            foreach (var colorTarget in ColorTargets)
-            {
-                ObjectiveCRuntime.retain(
-                    Util.AssertSubtype<Texture, MTLTexture>(colorTarget.Target).DeviceTexture.NativePtr);
-            }
-            if (DepthTarget != null)
-            {
-                ObjectiveCRuntime.retain(
-                    Util.AssertSubtype<Texture, MTLTexture>(DepthTarget.Value.Target)
-                        .DeviceTexture.NativePtr);
-            }
         }
 
         public override MTLRenderPassDescriptor CreateRenderPassDescriptor()
         {
-            MTLRenderPassDescriptor ret = MTLUtil.AllocInit<MTLRenderPassDescriptor>();
+            MTLRenderPassDescriptor ret = MTLRenderPassDescriptor.New();
             for (int i = 0; i < ColorTargets.Count; i++)
             {
                 FramebufferAttachment colorTarget = ColorTargets[i];
@@ -34,6 +23,7 @@ namespace Veldrid.MTL
                 colorDescriptor.texture = mtlTarget.DeviceTexture;
                 colorDescriptor.loadAction = MTLLoadAction.Load;
                 colorDescriptor.slice = (UIntPtr)colorTarget.ArrayLayer;
+                colorDescriptor.level = (UIntPtr)colorTarget.MipLevel;
             }
 
             if (DepthTarget != null)
@@ -44,6 +34,7 @@ namespace Veldrid.MTL
                 depthDescriptor.storeAction = MTLStoreAction.Store;
                 depthDescriptor.texture = mtlDepthTarget.DeviceTexture;
                 depthDescriptor.slice = (UIntPtr)DepthTarget.Value.ArrayLayer;
+                depthDescriptor.level = (UIntPtr)DepthTarget.Value.MipLevel;
 
                 if (FormatHelpers.IsStencilFormat(mtlDepthTarget.Format))
                 {
@@ -60,17 +51,6 @@ namespace Veldrid.MTL
 
         public override void Dispose()
         {
-            foreach (var colorTarget in ColorTargets)
-            {
-                ObjectiveCRuntime.release(
-                    Util.AssertSubtype<Texture, MTLTexture>(colorTarget.Target).DeviceTexture.NativePtr);
-            }
-            if (DepthTarget != null)
-            {
-                ObjectiveCRuntime.release(
-                    Util.AssertSubtype<Texture, MTLTexture>(DepthTarget.Value.Target)
-                        .DeviceTexture.NativePtr);
-            }
         }
     }
 }

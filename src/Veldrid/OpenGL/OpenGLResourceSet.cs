@@ -2,15 +2,14 @@
 {
     internal class OpenGLResourceSet : ResourceSet
     {
-        public OpenGLResourceLayout Layout { get; }
-        public BindableResource[] Resources { get; }
+        public new OpenGLResourceLayout Layout { get; }
+        public new BindableResource[] Resources { get; }
         public override string Name { get; set; }
 
-        public OpenGLResourceSet(ref ResourceSetDescription description)
-            : base(ref description)
+        public OpenGLResourceSet(ref ResourceSetDescription description) : base(ref description)
         {
             Layout = Util.AssertSubtype<ResourceLayout, OpenGLResourceLayout>(description.Layout);
-            Resources = description.BoundResources;
+            Resources = Util.ShallowClone(description.BoundResources);
         }
 
         public override void Dispose()

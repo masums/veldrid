@@ -21,13 +21,20 @@ namespace Veldrid.OpenGL
 
         public uint Shader => _shader;
 
-        public OpenGLShader(OpenGLGraphicsDevice gd, ShaderStages stage, StagingBlock stagingBlock)
-            : base(stage)
+        public OpenGLShader(OpenGLGraphicsDevice gd, ShaderStages stage, StagingBlock stagingBlock, string entryPoint)
+            : base(stage, entryPoint)
         {
 #if VALIDATE_USAGE
-            if (stage == ShaderStages.Compute && !gd.Extensions.ARB_ComputeShader)
+            if (stage == ShaderStages.Compute && !gd.Extensions.ComputeShaders)
             {
-                throw new VeldridException($"Compute shaders require OpenGL 4.3 or ARB_compute_shader.");
+                if (_gd.BackendType == GraphicsBackend.OpenGLES)
+                {
+                    throw new VeldridException("Compute shaders require OpenGL ES 3.1.");
+                }
+                else
+                {
+                    throw new VeldridException($"Compute shaders require OpenGL 4.3 or ARB_compute_shader.");
+                }
             }
 #endif
             _gd = gd;
@@ -58,14 +65,11 @@ namespace Veldrid.OpenGL
             _shader = glCreateShader(_shaderType);
             CheckLastError();
 
-            fixed (byte* arrayPtr = &_stagingBlock.Array[0])
-            {
-                byte* textPtr = arrayPtr;
-                int length = (int)_stagingBlock.SizeInBytes;
-                byte** textsPtr = &textPtr;
+            byte* textPtr = (byte*)_stagingBlock.Data;
+            int length = (int)_stagingBlock.SizeInBytes;
+            byte** textsPtr = &textPtr;
 
-                glShaderSource(_shader, 1, textsPtr, &length);
-            }
+            glShaderSource(_shader, 1, textsPtr, &length);
             CheckLastError();
 
             glCompileShader(_shader);
@@ -86,14 +90,14 @@ namespace Veldrid.OpenGL
                 glGetShaderInfoLog(_shader, (uint)infoLogLength, &returnedInfoLength, infoLog);
                 CheckLastError();
 
-                string message = infoLog != null 
+                string message = infoLog != null
                     ? Encoding.UTF8.GetString(infoLog, (int)returnedInfoLength)
                     : "<null>";
 
                 throw new VeldridException($"Unable to compile shader code for shader [{_name}] of type {_shaderType}: {message}");
             }
 
-            _stagingBlock.Free();
+            _gd.StagingMemoryPool.Free(_stagingBlock);
             Created = true;
         }
 
@@ -107,8 +111,15 @@ namespace Veldrid.OpenGL
             if (!_disposed)
             {
                 _disposed = true;
-                glDeleteShader(_shader);
-                CheckLastError();
+                if (Created)
+                {
+                    glDeleteShader(_shader);
+                    CheckLastError();
+                }
+                else
+                {
+                    _gd.StagingMemoryPool.Free(_stagingBlock);
+                }
             }
         }
     }

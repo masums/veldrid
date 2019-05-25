@@ -15,7 +15,9 @@ namespace Veldrid.Sdl2
 {
     public unsafe class Sdl2Window
     {
+        private readonly List<SDL_Event> _events = new List<SDL_Event>();
         private IntPtr _window;
+        internal uint WindowID { get; private set; }
         private bool _exists;
 
         private SimpleInputSnapshot _publicSnapshot = new SimpleInputSnapshot();
@@ -24,6 +26,7 @@ namespace Veldrid.Sdl2
 
         // Threaded Sdl2Window flags
         private readonly bool _threadedProcessing;
+
         private bool _shouldClose;
         public bool LimitPollRate { get; set; }
         public float PollIntervalInMs { get; set; }
@@ -32,12 +35,14 @@ namespace Veldrid.Sdl2
         private int _currentMouseX;
         private int _currentMouseY;
         private bool[] _currentMouseButtonStates = new bool[13];
+        private Vector2 _currentMouseDelta;
 
         // Cached Sdl2Window state (for threaded processing)
         private BufferedValue<Point> _cachedPosition = new BufferedValue<Point>();
         private BufferedValue<Point> _cachedSize = new BufferedValue<Point>();
         private string _cachedWindowTitle;
         private bool _newWindowTitleReceived;
+        private bool _firstMouseEvent = true;
 
         public Sdl2Window(string title, int x, int y, int width, int height, SDL_WindowFlags flags, bool threadedProcessing)
         {
@@ -64,6 +69,8 @@ namespace Veldrid.Sdl2
             else
             {
                 _window = SDL_CreateWindow(title, x, y, width, height, flags);
+                WindowID = SDL_GetWindowID(_window);
+                Sdl2WindowRegistry.RegisterWindow(this);
                 PostWindowCreated(flags);
             }
         }
@@ -89,6 +96,8 @@ namespace Veldrid.Sdl2
             else
             {
                 _window = SDL_CreateWindowFrom(windowHandle);
+                WindowID = SDL_GetWindowID(_window);
+                Sdl2WindowRegistry.RegisterWindow(this);
                 PostWindowCreated(0);
             }
         }
@@ -201,7 +210,36 @@ namespace Veldrid.Sdl2
             }
         }
 
+        public float Opacity
+        {
+            get
+            {
+                float opacity = float.NaN;
+                if (SDL_GetWindowOpacity(_window, &opacity) == 0)
+                {
+                    return opacity;
+                }
+                return float.NaN;
+            }
+            set
+            {
+                SDL_SetWindowOpacity(_window, value);
+            }
+        }
+
         public bool Focused => (SDL_GetWindowFlags(_window) & SDL_WindowFlags.InputFocus) != 0;
+
+        public bool Resizable
+        {
+            get => (SDL_GetWindowFlags(_window) & SDL_WindowFlags.Resizable) != 0;
+            set => SDL_SetWindowResizable(_window, value ? 1u : 0u);
+        }
+
+        public bool BorderVisible
+        {
+            get => (SDL_GetWindowFlags(_window) & SDL_WindowFlags.Borderless) == 0;
+            set => SDL_SetWindowBordered(_window, value ? 1u : 0u);
+        }
 
         public IntPtr SdlWindowHandle => _window;
 
@@ -222,12 +260,26 @@ namespace Veldrid.Sdl2
         public event Action<MouseEvent> MouseUp;
         public event Action<KeyEvent> KeyDown;
         public event Action<KeyEvent> KeyUp;
+        public event Action<DragDropEvent> DragDrop;
 
         public Point ClientToScreen(Point p)
         {
             Point position = _cachedPosition;
             return new Point(p.X + position.X, p.Y + position.Y);
         }
+
+        public void SetMousePosition(Vector2 position) => SetMousePosition((int)position.X, (int)position.Y);
+        public void SetMousePosition(int x, int y)
+        {
+            if (_exists)
+            {
+                SDL_WarpMouseInWindow(_window, x, y);
+                _currentMouseX = x;
+                _currentMouseY = y;
+            }
+        }
+
+        public Vector2 MouseDelta => _currentMouseDelta;
 
         public void Close()
         {
@@ -243,6 +295,7 @@ namespace Veldrid.Sdl2
 
         private void CloseCore()
         {
+            Sdl2WindowRegistry.RemoveWindow(this);
             Closing?.Invoke();
             SDL_DestroyWindow(_window);
             _exists = false;
@@ -253,6 +306,8 @@ namespace Veldrid.Sdl2
         {
             WindowParams wp = (WindowParams)state;
             _window = wp.Create();
+            WindowID = SDL_GetWindowID(_window);
+            Sdl2WindowRegistry.RegisterWindow(this);
             PostWindowCreated(wp.WindowFlags);
             wp.ResetEvent.Set();
 
@@ -277,7 +332,7 @@ namespace Veldrid.Sdl2
                 else
                 {
                     previousPollTimeMs = currentTimeMs;
-                    ProcessEvents();
+                    ProcessEvents(null);
                 }
             }
         }
@@ -290,11 +345,19 @@ namespace Veldrid.Sdl2
             {
                 SDL_ShowWindow(_window);
             }
+
             _exists = true;
+        }
+
+        // Called by Sdl2EventProcessor when an event for this window is encountered.
+        internal void AddEvent(SDL_Event ev)
+        {
+            _events.Add(ev);
         }
 
         public InputSnapshot PumpEvents()
         {
+            _currentMouseDelta = new Vector2();
             if (_threadedProcessing)
             {
                 SimpleInputSnapshot snapshot = Interlocked.Exchange(ref _privateSnapshot, _privateBackbuffer);
@@ -303,7 +366,7 @@ namespace Veldrid.Sdl2
             }
             else
             {
-                ProcessEvents();
+                ProcessEvents(null);
                 _privateSnapshot.CopyTo(_publicSnapshot);
                 _privateSnapshot.Clear();
             }
@@ -311,137 +374,86 @@ namespace Veldrid.Sdl2
             return _publicSnapshot;
         }
 
+        private void ProcessEvents(SDLEventHandler eventHandler)
+        {
+            CheckNewWindowTitle();
+
+            Sdl2Events.ProcessEvents();
+            for (int i = 0; i < _events.Count; i++)
+            {
+                SDL_Event ev = _events[i];
+                if (eventHandler == null)
+                {
+                    HandleEvent(&ev);
+                }
+                else
+                {
+                    eventHandler(ref ev);
+                }
+            }
+            _events.Clear();
+        }
+
         public void PumpEvents(SDLEventHandler eventHandler)
         {
             ProcessEvents(eventHandler);
         }
 
-        private void ProcessEvents()
+        private unsafe void HandleEvent(SDL_Event* ev)
         {
-            CheckNewWindowTitle();
-
-            SDL_Event ev;
-            while (SDL_PollEvent(&ev) != 0)
+            switch (ev->type)
             {
-                switch (ev.type)
-                {
-                    case SDL_EventType.Quit:
-                        Close();
-                        break;
-                    case SDL_EventType.Terminating:
-                        Close();
-                        break;
-                    case SDL_EventType.WindowEvent:
-                        SDL_WindowEvent windowEvent = Unsafe.Read<SDL_WindowEvent>(&ev);
-                        HandleWindowEvent(windowEvent);
-                        break;
-                    case SDL_EventType.KeyDown:
-                    case SDL_EventType.KeyUp:
-                        SDL_KeyboardEvent keyboardEvent = Unsafe.Read<SDL_KeyboardEvent>(&ev);
-                        HandleKeyboardEvent(keyboardEvent);
-                        break;
-                    case SDL_EventType.TextEditing:
-                        break;
-                    case SDL_EventType.TextInput:
-                        SDL_TextInputEvent textInputEvent = Unsafe.Read<SDL_TextInputEvent>(&ev);
-                        HandleTextInputEvent(textInputEvent);
-                        break;
-                    case SDL_EventType.KeyMapChanged:
-                        break;
-                    case SDL_EventType.MouseMotion:
-                        SDL_MouseMotionEvent mouseMotionEvent = Unsafe.Read<SDL_MouseMotionEvent>(&ev);
-                        HandleMouseMotionEvent(mouseMotionEvent);
-                        break;
-                    case SDL_EventType.MouseButtonDown:
-                    case SDL_EventType.MouseButtonUp:
-                        SDL_MouseButtonEvent mouseButtonEvent = Unsafe.Read<SDL_MouseButtonEvent>(&ev);
-                        HandleMouseButtonEvent(mouseButtonEvent);
-                        break;
-                    case SDL_EventType.MouseWheel:
-                        SDL_MouseWheelEvent mouseWheelEvent = Unsafe.Read<SDL_MouseWheelEvent>(&ev);
-                        HandleMouseWheelEvent(mouseWheelEvent);
-                        break;
-                    case SDL_EventType.JoyAxisMotion:
-                        break;
-                    case SDL_EventType.JoyBallMotion:
-                        break;
-                    case SDL_EventType.JoyHatMotion:
-                        break;
-                    case SDL_EventType.JoyButtonDown:
-                        break;
-                    case SDL_EventType.JoyButtonUp:
-                        break;
-                    case SDL_EventType.JoyDeviceAdded:
-                        break;
-                    case SDL_EventType.JoyDeviceRemoved:
-                        break;
-                    case SDL_EventType.ControllerAxisMotion:
-                        break;
-                    case SDL_EventType.ControllerButtonDown:
-                        break;
-                    case SDL_EventType.ControllerButtonUp:
-                        break;
-                    case SDL_EventType.ControllerDeviceAdded:
-                        break;
-                    case SDL_EventType.ControllerDeviceRemoved:
-                        break;
-                    case SDL_EventType.ControllerDeviceRemapped:
-                        break;
-                    case SDL_EventType.FingerDown:
-                        break;
-                    case SDL_EventType.FingerUp:
-                        break;
-                    case SDL_EventType.FingerMotion:
-                        break;
-                    case SDL_EventType.DollarGesture:
-                        break;
-                    case SDL_EventType.DollarRecord:
-                        break;
-                    case SDL_EventType.MultiGesture:
-                        break;
-                    case SDL_EventType.ClipboardUpdate:
-                        break;
-                    case SDL_EventType.DropFile:
-                        break;
-                    case SDL_EventType.DropTest:
-                        break;
-                    case SDL_EventType.DropBegin:
-                        break;
-                    case SDL_EventType.DropComplete:
-                        break;
-                    case SDL_EventType.AudioDeviceAdded:
-                        break;
-                    case SDL_EventType.AudioDeviceRemoved:
-                        break;
-                    case SDL_EventType.RenderTargetsReset:
-                        break;
-                    case SDL_EventType.RenderDeviceReset:
-                        break;
-                    case SDL_EventType.UserEvent:
-                        break;
-                    case SDL_EventType.LastEvent:
-                        break;
-                    default:
-                        // Ignore
-                        break;
-                }
-            }
-        }
-
-        private void ProcessEvents(SDLEventHandler eventHandler)
-        {
-            CheckNewWindowTitle();
-
-            SDL_Event ev;
-            while (SDL_PollEvent(&ev) != 0)
-            {
-                eventHandler(ref ev);
+                case SDL_EventType.Quit:
+                    Close();
+                    break;
+                case SDL_EventType.Terminating:
+                    Close();
+                    break;
+                case SDL_EventType.WindowEvent:
+                    SDL_WindowEvent windowEvent = Unsafe.Read<SDL_WindowEvent>(ev);
+                    HandleWindowEvent(windowEvent);
+                    break;
+                case SDL_EventType.KeyDown:
+                case SDL_EventType.KeyUp:
+                    SDL_KeyboardEvent keyboardEvent = Unsafe.Read<SDL_KeyboardEvent>(ev);
+                    HandleKeyboardEvent(keyboardEvent);
+                    break;
+                case SDL_EventType.TextEditing:
+                    break;
+                case SDL_EventType.TextInput:
+                    SDL_TextInputEvent textInputEvent = Unsafe.Read<SDL_TextInputEvent>(ev);
+                    HandleTextInputEvent(textInputEvent);
+                    break;
+                case SDL_EventType.KeyMapChanged:
+                    break;
+                case SDL_EventType.MouseMotion:
+                    SDL_MouseMotionEvent mouseMotionEvent = Unsafe.Read<SDL_MouseMotionEvent>(ev);
+                    HandleMouseMotionEvent(mouseMotionEvent);
+                    break;
+                case SDL_EventType.MouseButtonDown:
+                case SDL_EventType.MouseButtonUp:
+                    SDL_MouseButtonEvent mouseButtonEvent = Unsafe.Read<SDL_MouseButtonEvent>(ev);
+                    HandleMouseButtonEvent(mouseButtonEvent);
+                    break;
+                case SDL_EventType.MouseWheel:
+                    SDL_MouseWheelEvent mouseWheelEvent = Unsafe.Read<SDL_MouseWheelEvent>(ev);
+                    HandleMouseWheelEvent(mouseWheelEvent);
+                    break;
+                case SDL_EventType.DropFile:
+                case SDL_EventType.DropBegin:
+                case SDL_EventType.DropTest:
+                    SDL_DropEvent dropEvent = Unsafe.Read<SDL_DropEvent>(ev);
+                    HandleDropEvent(dropEvent);
+                    break;
+                default:
+                    // Ignore
+                    break;
             }
         }
 
         private void CheckNewWindowTitle()
         {
-            if (_newWindowTitleReceived)
+            if (WindowState != WindowState.Minimized && _newWindowTitleReceived)
             {
                 _newWindowTitleReceived = false;
                 SDL_SetWindowTitle(_window, _cachedWindowTitle);
@@ -473,6 +485,17 @@ namespace Veldrid.Sdl2
         {
             _privateSnapshot.WheelDelta += mouseWheelEvent.y;
             MouseWheel?.Invoke(new MouseWheelEventArgs(GetCurrentMouseState(), (float)mouseWheelEvent.y));
+        }
+
+        private void HandleDropEvent(SDL_DropEvent dropEvent)
+        {
+            string file = Utilities.GetString(dropEvent.file);
+            SDL_free(dropEvent.file);
+
+            if (dropEvent.type == SDL_EventType.DropFile)
+            {
+                DragDrop?.Invoke(new DragDropEvent(file));
+            }
         }
 
         private void HandleMouseButtonEvent(SDL_MouseButtonEvent mouseButtonEvent)
@@ -515,10 +538,18 @@ namespace Veldrid.Sdl2
         private void HandleMouseMotionEvent(SDL_MouseMotionEvent mouseMotionEvent)
         {
             Vector2 mousePos = new Vector2(mouseMotionEvent.x, mouseMotionEvent.y);
+            Vector2 delta = new Vector2(mouseMotionEvent.xrel, mouseMotionEvent.yrel);
             _currentMouseX = (int)mousePos.X;
             _currentMouseY = (int)mousePos.Y;
             _privateSnapshot.MousePosition = mousePos;
-            MouseMove?.Invoke(new MouseMoveEventArgs(GetCurrentMouseState(), mousePos));
+
+            if (!_firstMouseEvent)
+            {
+                _currentMouseDelta += delta;
+                MouseMove?.Invoke(new MouseMoveEventArgs(GetCurrentMouseState(), mousePos));
+            }
+
+            _firstMouseEvent = false;
         }
 
         private void HandleKeyboardEvent(SDL_KeyboardEvent keyboardEvent)
@@ -883,6 +914,7 @@ namespace Veldrid.Sdl2
         private void SetWindowPosition(int x, int y)
         {
             SDL_SetWindowPosition(_window, x, y);
+            _cachedPosition.Value = new Point(x, y);
         }
 
         private Point GetWindowSize()
@@ -893,6 +925,7 @@ namespace Veldrid.Sdl2
         private void SetWindowSize(int width, int height)
         {
             SDL_SetWindowSize(_window, width, height);
+            _cachedSize.Value = new Point(width, height);
         }
 
         private IntPtr GetUnderlyingWindowHandle()
@@ -908,9 +941,6 @@ namespace Veldrid.Sdl2
 
             return _window;
         }
-
-        private bool GetWindowBordered() => (SDL_GetWindowFlags(_window) & SDL_WindowFlags.Borderless) == 0;
-        private void SetWindowBordered(bool value) => SDL_SetWindowBordered(_window, value ? 1u : 0u);
 
         private class SimpleInputSnapshot : InputSnapshot
         {

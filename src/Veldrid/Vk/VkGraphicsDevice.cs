@@ -14,33 +14,38 @@ namespace Veldrid.Vk
     internal unsafe class VkGraphicsDevice : GraphicsDevice
     {
         private static readonly FixedUtf8String s_name = "Veldrid-VkGraphicsDevice";
+        private static readonly Lazy<bool> s_isSupported = new Lazy<bool>(CheckIsSupported, isThreadSafe: true);
 
         private VkInstance _instance;
         private VkPhysicalDevice _physicalDevice;
         private VkDeviceMemoryManager _memoryManager;
-        private VkSurfaceKHR _surface;
         private VkPhysicalDeviceProperties _physicalDeviceProperties;
         private VkPhysicalDeviceFeatures _physicalDeviceFeatures;
         private VkPhysicalDeviceMemoryProperties _physicalDeviceMemProperties;
         private VkDevice _device;
-        private readonly VkSwapchainFramebuffer _scFB;
         private uint _graphicsQueueIndex;
         private uint _presentQueueIndex;
         private VkCommandPool _graphicsCommandPool;
         private readonly object _graphicsCommandPoolLock = new object();
-        private Vulkan.VkFence _imageAvailableFence;
         private VkQueue _graphicsQueue;
         private readonly object _graphicsQueueLock = new object();
-        private VkQueue _presentQueue;
         private VkDebugReportCallbackEXT _debugCallbackHandle;
         private PFN_vkDebugReportCallbackEXT _debugCallbackFunc;
-        private readonly List<VkCommandList> _commandListsToDispose = new List<VkCommandList>();
         private bool _debugMarkerEnabled;
-        private vkDebugMarkerSetObjectNameEXT_d _setObjectNameDelegate;
+        private vkDebugMarkerSetObjectNameEXT_t _setObjectNameDelegate;
+        private vkCmdDebugMarkerBeginEXT_t _markerBegin;
+        private vkCmdDebugMarkerEndEXT_t _markerEnd;
+        private vkCmdDebugMarkerInsertEXT_t _markerInsert;
+        private readonly ConcurrentDictionary<VkFormat, VkFilter> _filters = new ConcurrentDictionary<VkFormat, VkFilter>();
+        private readonly BackendInfoVulkan _vulkanInfo;
 
         private const int SharedCommandPoolCount = 4;
         private ConcurrentStack<SharedCommandPool> _sharedGraphicsCommandPools = new ConcurrentStack<SharedCommandPool>();
         private VkDescriptorPoolManager _descriptorPoolManager;
+        private bool _standardValidationSupported;
+        private bool _standardClipYDirection;
+        private vkGetBufferMemoryRequirements2_t _getBufferMemoryRequirements2;
+        private vkGetImageMemoryRequirements2_t _getImageMemoryRequirements2;
 
         // Staging Resources
         private const uint MinStagingBufferSize = 64;
@@ -59,65 +64,110 @@ namespace Veldrid.Vk
 
         public override GraphicsBackend BackendType => GraphicsBackend.Vulkan;
 
+        public override bool IsUvOriginTopLeft => true;
+
+        public override bool IsDepthRangeZeroToOne => true;
+
+        public override bool IsClipSpaceYInverted => !_standardClipYDirection;
+
+        public override Swapchain MainSwapchain => _mainSwapchain;
+
+        public override GraphicsDeviceFeatures Features { get; }
+
+        public override bool GetVulkanInfo(out BackendInfoVulkan info)
+        {
+            info = _vulkanInfo;
+            return true;
+        }
+
+        public VkInstance Instance => _instance;
         public VkDevice Device => _device;
         public VkPhysicalDevice PhysicalDevice => _physicalDevice;
         public VkPhysicalDeviceMemoryProperties PhysicalDeviceMemProperties => _physicalDeviceMemProperties;
         public VkQueue GraphicsQueue => _graphicsQueue;
         public uint GraphicsQueueIndex => _graphicsQueueIndex;
-        public VkQueue PresentQueue => _presentQueue;
         public uint PresentQueueIndex => _presentQueueIndex;
         public VkDeviceMemoryManager MemoryManager => _memoryManager;
         public VkDescriptorPoolManager DescriptorPoolManager => _descriptorPoolManager;
+        public vkCmdDebugMarkerBeginEXT_t MarkerBegin => _markerBegin;
+        public vkCmdDebugMarkerEndEXT_t MarkerEnd => _markerEnd;
+        public vkCmdDebugMarkerInsertEXT_t MarkerInsert => _markerInsert;
+        public vkGetBufferMemoryRequirements2_t GetBufferMemoryRequirements2 => _getBufferMemoryRequirements2;
+        public vkGetImageMemoryRequirements2_t GetImageMemoryRequirements2 => _getImageMemoryRequirements2;
 
-        private readonly Queue<Vulkan.VkFence> _availableSubmissionFences = new Queue<Vulkan.VkFence>();
-        private readonly Dictionary<Vulkan.VkFence, (VkCommandList, VkCommandBuffer)> _submittedFences
-            = new Dictionary<Vulkan.VkFence, (VkCommandList, VkCommandBuffer)>();
-        private readonly List<KeyValuePair<Vulkan.VkFence, (VkCommandList, VkCommandBuffer)>> _completedFences
-            = new List<KeyValuePair<Vulkan.VkFence, (VkCommandList, VkCommandBuffer)>>();
+        private readonly object _submittedFencesLock = new object();
+        private readonly ConcurrentQueue<Vulkan.VkFence> _availableSubmissionFences = new ConcurrentQueue<Vulkan.VkFence>();
+        private readonly List<FenceSubmissionInfo> _submittedFences = new List<FenceSubmissionInfo>();
+        private readonly VkSwapchain _mainSwapchain;
 
-        public VkGraphicsDevice(GraphicsDeviceOptions options, VkSurfaceSource surfaceSource, uint width, uint height)
+        private readonly List<FixedUtf8String> _surfaceExtensions = new List<FixedUtf8String>();
+
+        public VkGraphicsDevice(GraphicsDeviceOptions options, SwapchainDescription? scDesc)
+            : this(options, scDesc, new VulkanDeviceOptions()) { }
+
+        public VkGraphicsDevice(GraphicsDeviceOptions options, SwapchainDescription? scDesc, VulkanDeviceOptions vkOptions)
         {
-            CreateInstance(options.Debug);
-            CreateSurface(surfaceSource);
+            CreateInstance(options.Debug, vkOptions);
+
+            VkSurfaceKHR surface = VkSurfaceKHR.Null;
+            if (scDesc != null)
+            {
+                surface = VkSurfaceUtil.CreateSurface(this, _instance, scDesc.Value.Source);
+            }
+
             CreatePhysicalDevice();
-            CreateLogicalDevice();
-            _memoryManager = new VkDeviceMemoryManager(_device, _physicalDevice);
+            CreateLogicalDevice(surface, options.PreferStandardClipSpaceYDirection, vkOptions);
+
+            _memoryManager = new VkDeviceMemoryManager(
+                _device,
+                _physicalDevice,
+                _physicalDeviceProperties.limits.bufferImageGranularity,
+                _getBufferMemoryRequirements2,
+                _getImageMemoryRequirements2);
+
+            Features = new GraphicsDeviceFeatures(
+                computeShader: true,
+                geometryShader: _physicalDeviceFeatures.geometryShader,
+                tessellationShaders: _physicalDeviceFeatures.tessellationShader,
+                multipleViewports: _physicalDeviceFeatures.multiViewport,
+                samplerLodBias: true,
+                drawBaseVertex: true,
+                drawBaseInstance: true,
+                drawIndirect: true,
+                drawIndirectBaseInstance: _physicalDeviceFeatures.drawIndirectFirstInstance,
+                fillModeWireframe: _physicalDeviceFeatures.fillModeNonSolid,
+                samplerAnisotropy: _physicalDeviceFeatures.samplerAnisotropy,
+                depthClipDisable: _physicalDeviceFeatures.depthClamp,
+                texture1D: true,
+                independentBlend: _physicalDeviceFeatures.independentBlend,
+                structuredBuffer: true,
+                subsetTextureView: true,
+                commandListDebugMarkers: _debugMarkerEnabled,
+                bufferRangeBinding: true);
+
             ResourceFactory = new VkResourceFactory(this);
-            _scFB = new VkSwapchainFramebuffer(
-                this,
-                _surface,
-                width,
-                height,
-                options.SyncToVerticalBlank,
-                options.SwapchainDepthFormat);
+
+            if (scDesc != null)
+            {
+                SwapchainDescription desc = scDesc.Value;
+                _mainSwapchain = new VkSwapchain(this, ref desc, surface);
+            }
+
             CreateDescriptorPool();
             CreateGraphicsCommandPool();
             for (int i = 0; i < SharedCommandPoolCount; i++)
             {
                 _sharedGraphicsCommandPools.Push(new SharedCommandPool(this, true));
             }
-            CreateFences();
 
-            _scFB.AcquireNextImage(_device, Vulkan.VkSemaphore.Null, _imageAvailableFence);
-            vkWaitForFences(_device, 1, ref _imageAvailableFence, true, ulong.MaxValue);
-            vkResetFences(_device, 1, ref _imageAvailableFence);
+            _vulkanInfo = new BackendInfoVulkan(this);
 
             PostDeviceCreated();
         }
 
         public override ResourceFactory ResourceFactory { get; }
 
-        public override Framebuffer SwapchainFramebuffer => _scFB;
-
-        public override bool SyncToVerticalBlank
-        {
-            get => _scFB.SyncToVerticalBlank;
-            set => _scFB.SyncToVerticalBlank = value;
-        }
-
-        protected override void SubmitCommandsCore(
-            CommandList cl,
-            Fence fence)
+        private protected override void SubmitCommandsCore(CommandList cl, Fence fence)
         {
             SubmitCommandList(cl, 0, null, 0, null, fence);
         }
@@ -133,6 +183,7 @@ namespace Veldrid.Vk
             VkCommandList vkCL = Util.AssertSubtype<CommandList, VkCommandList>(cl);
             VkCommandBuffer vkCB = vkCL.CommandBuffer;
 
+            vkCL.CommandBufferSubmitted(vkCB);
             SubmitCommandBuffer(vkCL, vkCB, waitSemaphoreCount, waitSemaphoresPtr, signalSemaphoreCount, signalSemaphoresPtr, fence);
         }
 
@@ -174,127 +225,127 @@ namespace Veldrid.Vk
 
             lock (_graphicsQueueLock)
             {
-                vkQueueSubmit(_graphicsQueue, 1, ref si, vkFence);
-                _submittedFences.Add(submissionFence, (vkCL, vkCB));
-
+                VkResult result = vkQueueSubmit(_graphicsQueue, 1, ref si, vkFence);
+                CheckResult(result);
                 if (useExtraFence)
                 {
-                    vkQueueSubmit(_graphicsQueue, 0, null, submissionFence);
+                    result = vkQueueSubmit(_graphicsQueue, 0, null, submissionFence);
+                    CheckResult(result);
                 }
+            }
+
+            lock (_submittedFencesLock)
+            {
+                _submittedFences.Add(new FenceSubmissionInfo(submissionFence, vkCL, vkCB));
             }
         }
 
         private void CheckSubmittedFences()
         {
-            Debug.Assert(_completedFences.Count == 0);
-
-            foreach (KeyValuePair<Vulkan.VkFence, (VkCommandList, VkCommandBuffer)> kvp in _submittedFences)
+            lock (_submittedFencesLock)
             {
-                if (vkGetFenceStatus(_device, kvp.Key) == VkResult.Success)
+                for (int i = 0; i < _submittedFences.Count; i++)
                 {
-                    _completedFences.Add(kvp);
+                    FenceSubmissionInfo fsi = _submittedFences[i];
+                    if (vkGetFenceStatus(_device, fsi.Fence) == VkResult.Success)
+                    {
+                        CompleteFenceSubmission(fsi);
+                        _submittedFences.RemoveAt(i);
+                        i -= 1;
+                    }
+                    else
+                    {
+                        break; // Submissions are in order; later submissions cannot complete if this one hasn't.
+                    }
                 }
             }
+        }
 
-            foreach (KeyValuePair<Vulkan.VkFence, (VkCommandList, VkCommandBuffer)> kvp in _completedFences)
+        private void CompleteFenceSubmission(FenceSubmissionInfo fsi)
+        {
+            Vulkan.VkFence fence = fsi.Fence;
+            VkCommandBuffer completedCB = fsi.CommandBuffer;
+            fsi.CommandList?.CommandBufferCompleted(completedCB);
+            VkResult resetResult = vkResetFences(_device, 1, ref fence);
+            CheckResult(resetResult);
+            ReturnSubmissionFence(fence);
+            lock (_stagingResourcesLock)
             {
-                Vulkan.VkFence fence = kvp.Key;
-                VkCommandBuffer completedCB = kvp.Value.Item2;
-                kvp.Value.Item1?.CommandBufferCompleted(completedCB);
-                bool result = _submittedFences.Remove(fence);
-                Debug.Assert(result);
-                VkResult resetResult = vkResetFences(_device, 1, ref fence);
-                CheckResult(resetResult);
-                _availableSubmissionFences.Enqueue(fence);
-                lock (_stagingResourcesLock)
+                if (_submittedStagingTextures.TryGetValue(completedCB, out VkTexture stagingTex))
                 {
-                    if (_submittedStagingTextures.TryGetValue(completedCB, out VkTexture stagingTex))
+                    _submittedStagingTextures.Remove(completedCB);
+                    _availableStagingTextures.Add(stagingTex);
+                }
+                if (_submittedStagingBuffers.TryGetValue(completedCB, out VkBuffer stagingBuffer))
+                {
+                    _submittedStagingBuffers.Remove(completedCB);
+                    if (stagingBuffer.SizeInBytes <= MaxStagingBufferSize)
                     {
-                        _submittedStagingTextures.Remove(completedCB);
-                        _availableStagingTextures.Add(stagingTex);
+                        _availableStagingBuffers.Add(stagingBuffer);
                     }
-                    if (_submittedStagingBuffers.TryGetValue(completedCB, out VkBuffer stagingBuffer))
+                    else
                     {
-                        _submittedStagingBuffers.Remove(completedCB);
-                        if (stagingBuffer.SizeInBytes <= MaxStagingBufferSize)
+                        stagingBuffer.Dispose();
+                    }
+                }
+                if (_submittedSharedCommandPools.TryGetValue(completedCB, out SharedCommandPool sharedPool))
+                {
+                    _submittedSharedCommandPools.Remove(completedCB);
+                    lock (_graphicsCommandPoolLock)
+                    {
+                        if (sharedPool.IsCached)
                         {
-                            _availableStagingBuffers.Add(stagingBuffer);
+                            _sharedGraphicsCommandPools.Push(sharedPool);
                         }
                         else
                         {
-                            stagingBuffer.Dispose();
-                        }
-                    }
-                    if (_submittedSharedCommandPools.TryGetValue(completedCB, out SharedCommandPool sharedPool))
-                    {
-                        _submittedSharedCommandPools.Remove(completedCB);
-                        lock (_graphicsCommandPoolLock)
-                        {
-                            if (sharedPool.IsCached)
-                            {
-                                sharedPool.Reset();
-                                _sharedGraphicsCommandPools.Push(sharedPool);
-                            }
-                            else
-                            {
-                                sharedPool.Destroy();
-                            }
+                            sharedPool.Destroy();
                         }
                     }
                 }
             }
+        }
 
-            _completedFences.Clear();
+        private void ReturnSubmissionFence(Vulkan.VkFence fence)
+        {
+            _availableSubmissionFences.Enqueue(fence);
         }
 
         private Vulkan.VkFence GetFreeSubmissionFence()
         {
-            if (_availableSubmissionFences.Count > 0)
+            if (_availableSubmissionFences.TryDequeue(out Vulkan.VkFence availableFence))
             {
-                return _availableSubmissionFences.Dequeue();
+                return availableFence;
             }
             else
             {
                 VkFenceCreateInfo fenceCI = VkFenceCreateInfo.New();
-                VkResult result = vkCreateFence(_device, ref fenceCI, null, out Vulkan.VkFence ret);
+                VkResult result = vkCreateFence(_device, ref fenceCI, null, out Vulkan.VkFence newFence);
                 CheckResult(result);
-                return ret;
+                return newFence;
             }
         }
 
-        public void EnqueueDisposedCommandBuffer(VkCommandList vkCL)
+        private protected override void SwapBuffersCore(Swapchain swapchain)
         {
-            lock (_commandListsToDispose)
-            {
-                _commandListsToDispose.Add(vkCL);
-            }
-        }
-
-        public override void ResizeMainWindow(uint width, uint height)
-        {
-            _scFB.Resize(width, height);
-            _scFB.AcquireNextImage(_device, Vulkan.VkSemaphore.Null, _imageAvailableFence);
-            vkWaitForFences(_device, 1, ref _imageAvailableFence, true, ulong.MaxValue);
-            vkResetFences(_device, 1, ref _imageAvailableFence);
-        }
-
-        protected override void SwapBuffersCore()
-        {
-            // Then, present the swapchain.
+            VkSwapchain vkSC = Util.AssertSubtype<Swapchain, VkSwapchain>(swapchain);
+            VkSwapchainKHR deviceSwapchain = vkSC.DeviceSwapchain;
             VkPresentInfoKHR presentInfo = VkPresentInfoKHR.New();
-
-            VkSwapchainKHR swapchain = _scFB.Swapchain;
             presentInfo.swapchainCount = 1;
-            presentInfo.pSwapchains = &swapchain;
-            uint imageIndex = _scFB.ImageIndex;
+            presentInfo.pSwapchains = &deviceSwapchain;
+            uint imageIndex = vkSC.ImageIndex;
             presentInfo.pImageIndices = &imageIndex;
 
-            vkQueuePresentKHR(_presentQueue, ref presentInfo);
-
-            if (_scFB.AcquireNextImage(_device, VkSemaphore.Null, _imageAvailableFence))
+            object presentLock = vkSC.PresentQueueIndex == _graphicsQueueIndex ? _graphicsQueueLock : vkSC;
+            lock (presentLock)
             {
-                vkWaitForFences(_device, 1, ref _imageAvailableFence, true, ulong.MaxValue);
-                vkResetFences(_device, 1, ref _imageAvailableFence);
+                vkQueuePresentKHR(vkSC.PresentQueue, ref presentInfo);
+                if (vkSC.AcquireNextImage(_device, VkSemaphore.Null, vkSC.ImageAvailableFence))
+                {
+                    Vulkan.VkFence fence = vkSC.ImageAvailableFence;
+                    vkWaitForFences(_device, 1, ref fence, true, ulong.MaxValue);
+                    vkResetFences(_device, 1, ref fence);
+                }
             }
         }
 
@@ -351,6 +402,9 @@ namespace Veldrid.Vk
                     case VkFence fence:
                         SetDebugMarkerName(VkDebugReportObjectTypeEXT.FenceEXT, fence.DeviceFence.Handle, name);
                         break;
+                    case VkSwapchain sc:
+                        SetDebugMarkerName(VkDebugReportObjectTypeEXT.SwapchainKHREXT, sc.DeviceSwapchain.Handle, name);
+                        break;
                     default:
                         break;
                 }
@@ -376,20 +430,7 @@ namespace Veldrid.Vk
             }
         }
 
-        private void FlushQueuedDisposables()
-        {
-            lock (_commandListsToDispose)
-            {
-                foreach (VkCommandList vkCB in _commandListsToDispose)
-                {
-                    vkCB.DestroyCommandPool();
-                }
-
-                _commandListsToDispose.Clear();
-            }
-        }
-
-        private void CreateInstance(bool debug)
+        private void CreateInstance(bool debug, VulkanDeviceOptions options)
         {
             HashSet<string> availableInstanceLayers = new HashSet<string>(EnumerateInstanceLayers());
             HashSet<string> availableInstanceExtensions = new HashSet<string>(GetInstanceExtensions());
@@ -407,34 +448,74 @@ namespace Veldrid.Vk
             StackList<IntPtr, Size64Bytes> instanceExtensions = new StackList<IntPtr, Size64Bytes>();
             StackList<IntPtr, Size64Bytes> instanceLayers = new StackList<IntPtr, Size64Bytes>();
 
-            if (!availableInstanceExtensions.Contains(CommonStrings.VK_KHR_SURFACE_EXTENSION_NAME))
+            if (availableInstanceExtensions.Contains(CommonStrings.VK_KHR_SURFACE_EXTENSION_NAME))
             {
-                throw new VeldridException($"The required instance extension was not available: {CommonStrings.VK_KHR_SURFACE_EXTENSION_NAME}");
+                _surfaceExtensions.Add(CommonStrings.VK_KHR_SURFACE_EXTENSION_NAME);
             }
-
-            instanceExtensions.Add(CommonStrings.VK_KHR_SURFACE_EXTENSION_NAME);
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                if (!availableInstanceExtensions.Contains(CommonStrings.VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
+                if (availableInstanceExtensions.Contains(CommonStrings.VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
                 {
-                    throw new VeldridException($"The required instance extension was not available: {CommonStrings.VK_KHR_WIN32_SURFACE_EXTENSION_NAME}");
+                    _surfaceExtensions.Add(CommonStrings.VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
                 }
-
-                instanceExtensions.Add(CommonStrings.VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                if (!availableInstanceExtensions.Contains(CommonStrings.VK_KHR_XLIB_SURFACE_EXTENSION_NAME))
+                if (RuntimeInformation.OSDescription.Contains("Unix")) // Android
                 {
-                    throw new VeldridException($"The required instance extension was not available: {CommonStrings.VK_KHR_XLIB_SURFACE_EXTENSION_NAME}");
+                    if (availableInstanceExtensions.Contains(CommonStrings.VK_KHR_ANDROID_SURFACE_EXTENSION_NAME))
+                    {
+                        _surfaceExtensions.Add(CommonStrings.VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+                    }
+                }
+                else // Desktop Linux
+                {
+                    if (availableInstanceExtensions.Contains(CommonStrings.VK_KHR_XLIB_SURFACE_EXTENSION_NAME))
+                    {
+                        _surfaceExtensions.Add(CommonStrings.VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+                    }
+                    if (availableInstanceExtensions.Contains(CommonStrings.VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME))
+                    {
+                        _surfaceExtensions.Add(CommonStrings.VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+                    }
+                }
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                if (RuntimeInformation.OSDescription.Contains("Darwin")) // macOS
+                {
+                    if (availableInstanceExtensions.Contains(CommonStrings.VK_MVK_MACOS_SURFACE_EXTENSION_NAME))
+                    {
+                        _surfaceExtensions.Add(CommonStrings.VK_MVK_MACOS_SURFACE_EXTENSION_NAME);
+                    }
+                }
+                else // iOS
+                {
+                    if (availableInstanceExtensions.Contains(CommonStrings.VK_MVK_IOS_SURFACE_EXTENSION_NAME))
+                    {
+                        _surfaceExtensions.Add(CommonStrings.VK_MVK_IOS_SURFACE_EXTENSION_NAME);
+                    }
+                }
+            }
+
+            foreach (var ext in _surfaceExtensions)
+            {
+                instanceExtensions.Add(ext);
+            }
+
+            string[] requestedInstanceExtensions = options.InstanceExtensions ?? Array.Empty<string>();
+            List<FixedUtf8String> tempStrings = new List<FixedUtf8String>();
+            foreach (string requiredExt in requestedInstanceExtensions)
+            {
+                if (!availableInstanceExtensions.Contains(requiredExt))
+                {
+                    throw new VeldridException($"The required instance extension was not available: {requiredExt}");
                 }
 
-                instanceExtensions.Add(CommonStrings.VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
-            }
-            else
-            {
-                throw new NotSupportedException("This platform does not support Vulkan.");
+                FixedUtf8String utf8Str = new FixedUtf8String(requiredExt);
+                instanceExtensions.Add(utf8Str);
+                tempStrings.Add(utf8Str);
             }
 
             bool debugReportExtensionAvailable = false;
@@ -447,6 +528,7 @@ namespace Veldrid.Vk
                 }
                 if (availableInstanceLayers.Contains(CommonStrings.StandardValidationLayerName))
                 {
+                    _standardValidationSupported = true;
                     instanceLayers.Add(CommonStrings.StandardValidationLayerName);
                 }
             }
@@ -455,7 +537,10 @@ namespace Veldrid.Vk
             instanceCI.ppEnabledExtensionNames = (byte**)instanceExtensions.Data;
 
             instanceCI.enabledLayerCount = instanceLayers.Count;
-            instanceCI.ppEnabledLayerNames = (byte**)instanceLayers.Data;
+            if (instanceLayers.Count > 0)
+            {
+                instanceCI.ppEnabledLayerNames = (byte**)instanceLayers.Data;
+            }
 
             VkResult result = vkCreateInstance(ref instanceCI, null, out _instance);
             CheckResult(result);
@@ -464,6 +549,16 @@ namespace Veldrid.Vk
             {
                 EnableDebugCallback();
             }
+
+            foreach (FixedUtf8String tempStr in tempStrings)
+            {
+                tempStr.Dispose();
+            }
+        }
+
+        public bool HasSurfaceExtension(FixedUtf8String extension)
+        {
+            return _surfaceExtensions.Contains(extension);
         }
 
         public void EnableDebugCallback(VkDebugReportFlagsEXT flags = VkDebugReportFlagsEXT.WarningEXT | VkDebugReportFlagsEXT.ErrorEXT)
@@ -479,6 +574,11 @@ namespace Veldrid.Vk
             {
                 createFnPtr = vkGetInstanceProcAddr(_instance, debugExtFnName);
             }
+            if (createFnPtr == IntPtr.Zero)
+            {
+                return;
+            }
+
             vkCreateDebugReportCallbackEXT_d createDelegate = Marshal.GetDelegateForFunctionPointer<vkCreateDebugReportCallbackEXT_d>(createFnPtr);
             VkResult result = createDelegate(_instance, &debugCallbackCI, IntPtr.Zero, out _debugCallbackHandle);
             CheckResult(result);
@@ -515,11 +615,6 @@ namespace Veldrid.Vk
             return 0;
         }
 
-        private void CreateSurface(VkSurfaceSource surfaceSource)
-        {
-            _surface = surfaceSource.CreateSurface(_instance);
-        }
-
         private void CreatePhysicalDevice()
         {
             uint deviceCount = 0;
@@ -546,9 +641,9 @@ namespace Veldrid.Vk
             vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out _physicalDeviceMemProperties);
         }
 
-        private void CreateLogicalDevice()
+        private void CreateLogicalDevice(VkSurfaceKHR surface, bool preferStandardClipY, VulkanDeviceOptions options)
         {
-            GetQueueFamilyIndices();
+            GetQueueFamilyIndices(surface);
 
             HashSet<uint> familyIndices = new HashSet<uint> { _graphicsQueueIndex, _presentQueueIndex };
             VkDeviceQueueCreateInfo* queueCreateInfos = stackalloc VkDeviceQueueCreateInfo[familyIndices.Count];
@@ -567,14 +662,16 @@ namespace Veldrid.Vk
             }
 
             VkPhysicalDeviceFeatures deviceFeatures = new VkPhysicalDeviceFeatures();
-            deviceFeatures.samplerAnisotropy = true;
-            deviceFeatures.fillModeNonSolid = true;
-            deviceFeatures.geometryShader = true;
-            deviceFeatures.depthClamp = true;
-            deviceFeatures.multiViewport = true;
-            deviceFeatures.textureCompressionBC = true;
-
-            bool debugMarkerSupported = false;
+            deviceFeatures.samplerAnisotropy = _physicalDeviceFeatures.samplerAnisotropy;
+            deviceFeatures.fillModeNonSolid = _physicalDeviceFeatures.fillModeNonSolid;
+            deviceFeatures.geometryShader = _physicalDeviceFeatures.geometryShader;
+            deviceFeatures.depthClamp = _physicalDeviceFeatures.depthClamp;
+            deviceFeatures.multiViewport = _physicalDeviceFeatures.multiViewport;
+            deviceFeatures.textureCompressionBC = _physicalDeviceFeatures.textureCompressionBC;
+            deviceFeatures.textureCompressionETC2 = _physicalDeviceFeatures.textureCompressionETC2;
+            deviceFeatures.multiDrawIndirect = _physicalDeviceFeatures.multiDrawIndirect;
+            deviceFeatures.drawIndirectFirstInstance = _physicalDeviceFeatures.drawIndirectFirstInstance;
+            deviceFeatures.shaderStorageImageMultisample = _physicalDeviceFeatures.shaderStorageImageMultisample;
 
             uint propertyCount = 0;
             VkResult result = vkEnumerateDeviceExtensionProperties(_physicalDevice, (byte*)null, &propertyCount, null);
@@ -583,13 +680,54 @@ namespace Veldrid.Vk
             result = vkEnumerateDeviceExtensionProperties(_physicalDevice, (byte*)null, &propertyCount, properties);
             CheckResult(result);
 
+            HashSet<string> requiredInstanceExtensions = new HashSet<string>(options.DeviceExtensions ?? Array.Empty<string>());
+
+            bool hasMemReqs2 = false;
+            bool hasDedicatedAllocation = false;
+            StackList<IntPtr> extensionNames = new StackList<IntPtr>();
             for (int property = 0; property < propertyCount; property++)
             {
-                if (Util.GetString(properties[property].extensionName) == "VK_EXT_debug_marker")
+                string extensionName = Util.GetString(properties[property].extensionName);
+                if (extensionName == "VK_EXT_debug_marker")
                 {
-                    debugMarkerSupported = true;
-                    break;
+                    extensionNames.Add(CommonStrings.VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
+                    requiredInstanceExtensions.Remove(extensionName);
+                    _debugMarkerEnabled = true;
                 }
+                else if (extensionName == "VK_KHR_swapchain")
+                {
+                    extensionNames.Add((IntPtr)properties[property].extensionName);
+                    requiredInstanceExtensions.Remove(extensionName);
+                }
+                else if (preferStandardClipY && extensionName == "VK_KHR_maintenance1")
+                {
+                    extensionNames.Add((IntPtr)properties[property].extensionName);
+                    requiredInstanceExtensions.Remove(extensionName);
+                    _standardClipYDirection = true;
+                }
+                else if (extensionName == "VK_KHR_get_memory_requirements2")
+                {
+                    extensionNames.Add((IntPtr)properties[property].extensionName);
+                    requiredInstanceExtensions.Remove(extensionName);
+                    hasMemReqs2 = true;
+                }
+                else if (extensionName == "VK_KHR_dedicated_allocation")
+                {
+                    extensionNames.Add((IntPtr)properties[property].extensionName);
+                    requiredInstanceExtensions.Remove(extensionName);
+                    hasDedicatedAllocation = true;
+                }
+                else if (requiredInstanceExtensions.Remove(extensionName))
+                {
+                    extensionNames.Add((IntPtr)properties[property].extensionName);
+                }
+            }
+
+            if (requiredInstanceExtensions.Count != 0)
+            {
+                string missingList = string.Join(", ", requiredInstanceExtensions);
+                throw new VeldridException(
+                    $"The following Vulkan device extensions were not available: {missingList}");
             }
 
             VkDeviceCreateInfo deviceCreateInfo = VkDeviceCreateInfo.New();
@@ -599,17 +737,13 @@ namespace Veldrid.Vk
             deviceCreateInfo.pEnabledFeatures = &deviceFeatures;
 
             StackList<IntPtr> layerNames = new StackList<IntPtr>();
-            layerNames.Add(CommonStrings.StandardValidationLayerName);
+            if (_standardValidationSupported)
+            {
+                layerNames.Add(CommonStrings.StandardValidationLayerName);
+            }
             deviceCreateInfo.enabledLayerCount = layerNames.Count;
             deviceCreateInfo.ppEnabledLayerNames = (byte**)layerNames.Data;
 
-            StackList<IntPtr> extensionNames = new StackList<IntPtr>();
-            extensionNames.Add(CommonStrings.VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-            if (debugMarkerSupported)
-            {
-                extensionNames.Add(CommonStrings.VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
-                _debugMarkerEnabled = true;
-            }
             deviceCreateInfo.enabledExtensionCount = extensionNames.Count;
             deviceCreateInfo.ppEnabledExtensionNames = (byte**)extensionNames.Data;
 
@@ -617,21 +751,61 @@ namespace Veldrid.Vk
             CheckResult(result);
 
             vkGetDeviceQueue(_device, _graphicsQueueIndex, 0, out _graphicsQueue);
-            vkGetDeviceQueue(_device, _presentQueueIndex, 0, out _presentQueue);
 
-            if (debugMarkerSupported)
+            if (_debugMarkerEnabled)
             {
-                IntPtr setObjectNamePtr;
-                using (FixedUtf8String debugExtFnName = "vkDebugMarkerSetObjectNameEXT")
-                {
-                    setObjectNamePtr = vkGetInstanceProcAddr(_instance, debugExtFnName);
-                }
-
-                _setObjectNameDelegate = Marshal.GetDelegateForFunctionPointer<vkDebugMarkerSetObjectNameEXT_d>(setObjectNamePtr);
+                _setObjectNameDelegate = Marshal.GetDelegateForFunctionPointer<vkDebugMarkerSetObjectNameEXT_t>(
+                    GetInstanceProcAddr("vkDebugMarkerSetObjectNameEXT"));
+                _markerBegin = Marshal.GetDelegateForFunctionPointer<vkCmdDebugMarkerBeginEXT_t>(
+                    GetInstanceProcAddr("vkCmdDebugMarkerBeginEXT"));
+                _markerEnd = Marshal.GetDelegateForFunctionPointer<vkCmdDebugMarkerEndEXT_t>(
+                    GetInstanceProcAddr("vkCmdDebugMarkerEndEXT"));
+                _markerInsert = Marshal.GetDelegateForFunctionPointer<vkCmdDebugMarkerInsertEXT_t>(
+                    GetInstanceProcAddr("vkCmdDebugMarkerInsertEXT"));
+            }
+            if (hasDedicatedAllocation && hasMemReqs2)
+            {
+                _getBufferMemoryRequirements2 = GetDeviceProcAddr<vkGetBufferMemoryRequirements2_t>("vkGetBufferMemoryRequirements2")
+                    ?? GetDeviceProcAddr<vkGetBufferMemoryRequirements2_t>("vkGetBufferMemoryRequirements2KHR");
+                _getImageMemoryRequirements2 = GetDeviceProcAddr<vkGetImageMemoryRequirements2_t>("vkGetImageMemoryRequirements2")
+                    ?? GetDeviceProcAddr<vkGetImageMemoryRequirements2_t>("vkGetImageMemoryRequirements2KHR");
             }
         }
 
-        private void GetQueueFamilyIndices()
+        private IntPtr GetInstanceProcAddr(string name)
+        {
+            int byteCount = Encoding.UTF8.GetByteCount(name);
+            byte* utf8Ptr = stackalloc byte[byteCount];
+
+            fixed (char* namePtr = name)
+            {
+                Encoding.UTF8.GetBytes(namePtr, name.Length, utf8Ptr, byteCount);
+            }
+
+            return vkGetInstanceProcAddr(_instance, utf8Ptr);
+        }
+
+        private IntPtr GetDeviceProcAddr(string name)
+        {
+            int byteCount = Encoding.UTF8.GetByteCount(name);
+            byte* utf8Ptr = stackalloc byte[byteCount];
+
+            fixed (char* namePtr = name)
+            {
+                Encoding.UTF8.GetBytes(namePtr, name.Length, utf8Ptr, byteCount);
+            }
+
+            return vkGetDeviceProcAddr(_device, utf8Ptr);
+        }
+
+        private T GetDeviceProcAddr<T>(string name)
+        {
+            IntPtr funcPtr = GetDeviceProcAddr(name);
+            if (funcPtr != IntPtr.Zero) { return Marshal.GetDelegateForFunctionPointer<T>(funcPtr); }
+            else { return default; }
+        }
+
+        private void GetQueueFamilyIndices(VkSurfaceKHR surface)
         {
             uint queueFamilyCount = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(_physicalDevice, ref queueFamilyCount, null);
@@ -639,26 +813,28 @@ namespace Veldrid.Vk
             vkGetPhysicalDeviceQueueFamilyProperties(_physicalDevice, ref queueFamilyCount, out qfp[0]);
 
             bool foundGraphics = false;
-            bool foundPresent = false;
+            bool foundPresent = surface == VkSurfaceKHR.Null;
 
             for (uint i = 0; i < qfp.Length; i++)
             {
                 if ((qfp[i].queueFlags & VkQueueFlags.Graphics) != 0)
                 {
                     _graphicsQueueIndex = i;
-                    foundGraphics = true;
                 }
 
-                vkGetPhysicalDeviceSurfaceSupportKHR(_physicalDevice, i, _surface, out VkBool32 presentSupported);
-                if (presentSupported)
+                if (!foundPresent)
                 {
-                    _presentQueueIndex = i;
-                    foundPresent = true;
+                    vkGetPhysicalDeviceSurfaceSupportKHR(_physicalDevice, i, surface, out VkBool32 presentSupported);
+                    if (presentSupported)
+                    {
+                        _presentQueueIndex = i;
+                        foundPresent = true;
+                    }
                 }
 
                 if (foundGraphics && foundPresent)
                 {
-                    break;
+                    return;
                 }
             }
         }
@@ -677,16 +853,9 @@ namespace Veldrid.Vk
             CheckResult(result);
         }
 
-        private void CreateFences()
-        {
-            VkFenceCreateInfo fenceCI = VkFenceCreateInfo.New();
-            fenceCI.flags = VkFenceCreateFlags.None;
-            vkCreateFence(_device, ref fenceCI, null, out _imageAvailableFence);
-        }
-
         protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
         {
-            VkMemoryBlock memoryBlock = null;
+            VkMemoryBlock memoryBlock = default(VkMemoryBlock);
             IntPtr mappedPtr = IntPtr.Zero;
             uint sizeInBytes;
             uint offset = 0;
@@ -708,7 +877,7 @@ namespace Veldrid.Vk
                 depthPitch = (uint)layout.depthPitch;
             }
 
-            if (memoryBlock != null)
+            if (memoryBlock.DeviceMemory.Handle != 0)
             {
                 if (memoryBlock.IsPersistentMapped)
                 {
@@ -733,7 +902,7 @@ namespace Veldrid.Vk
 
         protected override void UnmapCore(MappableResource resource, uint subresource)
         {
-            VkMemoryBlock memoryBlock = null;
+            VkMemoryBlock memoryBlock = default(VkMemoryBlock);
             if (resource is VkBuffer buffer)
             {
                 memoryBlock = buffer.Memory;
@@ -744,7 +913,7 @@ namespace Veldrid.Vk
                 memoryBlock = tex.Memory;
             }
 
-            if (memoryBlock != null && !memoryBlock.IsPersistentMapped)
+            if (memoryBlock.DeviceMemory.Handle != 0 && !memoryBlock.IsPersistentMapped)
             {
                 vkUnmapMemory(_device, memoryBlock.DeviceMemory);
             }
@@ -758,8 +927,7 @@ namespace Veldrid.Vk
                 vkDestroyFence(_device, fence, null);
             }
 
-            _scFB.Dispose();
-            vkDestroySurfaceKHR(_instance, _surface, null);
+            _mainSwapchain?.Dispose();
             if (_debugCallbackFunc != null)
             {
                 _debugCallbackFunc = null;
@@ -767,13 +935,11 @@ namespace Veldrid.Vk
                 IntPtr destroyFuncPtr = vkGetInstanceProcAddr(_instance, debugExtFnName);
                 vkDestroyDebugReportCallbackEXT_d destroyDel
                     = Marshal.GetDelegateForFunctionPointer<vkDestroyDebugReportCallbackEXT_d>(destroyFuncPtr);
-                VkResult debugDestroyResult = destroyDel(_instance, _debugCallbackHandle, null);
-                CheckResult(debugDestroyResult);
+                destroyDel(_instance, _debugCallbackHandle, null);
             }
 
             _descriptorPoolManager.DestroyAll();
             vkDestroyCommandPool(_device, _graphicsCommandPool, null);
-            vkDestroyFence(_device, _imageAvailableFence, null);
 
             Debug.Assert(_submittedStagingTextures.Count == 0);
             foreach (VkTexture tex in _availableStagingTextures)
@@ -800,11 +966,14 @@ namespace Veldrid.Vk
             vkDestroyInstance(_instance, null);
         }
 
-        protected override void WaitForIdleCore()
+        private protected override void WaitForIdleCore()
         {
-            vkQueueWaitIdle(_graphicsQueue);
+            lock (_graphicsQueueLock)
+            {
+                vkQueueWaitIdle(_graphicsQueue);
+            }
+
             CheckSubmittedFences();
-            FlushQueuedDisposables();
         }
 
         public override TextureSampleCount GetSampleCountLimit(PixelFormat format, bool depthFormat)
@@ -846,23 +1015,76 @@ namespace Veldrid.Vk
             return TextureSampleCount.Count1;
         }
 
-        protected override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
+        private protected override bool GetPixelFormatSupportCore(
+            PixelFormat format,
+            TextureType type,
+            TextureUsage usage,
+            out PixelFormatProperties properties)
+        {
+            VkFormat vkFormat = VkFormats.VdToVkPixelFormat(format, (usage & TextureUsage.DepthStencil) != 0);
+            VkImageType vkType = VkFormats.VdToVkTextureType(type);
+            VkImageTiling tiling = usage == TextureUsage.Staging ? VkImageTiling.Linear : VkImageTiling.Optimal;
+            VkImageUsageFlags vkUsage = VkFormats.VdToVkTextureUsage(usage);
+
+            VkResult result = vkGetPhysicalDeviceImageFormatProperties(
+                _physicalDevice,
+                vkFormat,
+                vkType,
+                tiling,
+                vkUsage,
+                VkImageCreateFlags.None,
+                out VkImageFormatProperties vkProps);
+
+            if (result == VkResult.ErrorFormatNotSupported)
+            {
+                properties = default(PixelFormatProperties);
+                return false;
+            }
+            CheckResult(result);
+
+            properties = new PixelFormatProperties(
+               vkProps.maxExtent.width,
+               vkProps.maxExtent.height,
+               vkProps.maxExtent.depth,
+               vkProps.maxMipLevels,
+               vkProps.maxArrayLayers,
+               (uint)vkProps.sampleCounts);
+            return true;
+        }
+
+        internal VkFilter GetFormatFilter(VkFormat format)
+        {
+            if (!_filters.TryGetValue(format, out VkFilter filter))
+            {
+                vkGetPhysicalDeviceFormatProperties(_physicalDevice, format, out VkFormatProperties vkFormatProps);
+                filter = (vkFormatProps.optimalTilingFeatures & VkFormatFeatureFlags.SampledImageFilterLinear) != 0
+                    ? VkFilter.Linear
+                    : VkFilter.Nearest;
+                _filters.TryAdd(format, filter);
+            }
+
+            return filter;
+        }
+
+        private protected override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
         {
             VkBuffer vkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(buffer);
             VkBuffer copySrcVkBuffer = null;
             IntPtr mappedPtr;
+            byte* destPtr;
             bool isPersistentMapped = vkBuffer.Memory.IsPersistentMapped;
             if (isPersistentMapped)
             {
                 mappedPtr = (IntPtr)vkBuffer.Memory.BlockMappedPointer;
+                destPtr = (byte*)mappedPtr + bufferOffsetInBytes;
             }
             else
             {
                 copySrcVkBuffer = GetFreeStagingBuffer(sizeInBytes);
                 mappedPtr = (IntPtr)copySrcVkBuffer.Memory.BlockMappedPointer;
+                destPtr = (byte*)mappedPtr;
             }
 
-            byte* destPtr = (byte*)mappedPtr + bufferOffsetInBytes;
             Unsafe.CopyBlock(destPtr, source.ToPointer(), sizeInBytes);
 
             if (!isPersistentMapped)
@@ -870,7 +1092,11 @@ namespace Veldrid.Vk
                 SharedCommandPool pool = GetFreeCommandPool();
                 VkCommandBuffer cb = pool.BeginNewCommandBuffer();
 
-                VkBufferCopy copyRegion = new VkBufferCopy { size = vkBuffer.BufferMemoryRequirements.size };
+                VkBufferCopy copyRegion = new VkBufferCopy
+                {
+                    dstOffset = bufferOffsetInBytes,
+                    size = sizeInBytes
+                };
                 vkCmdCopyBuffer(cb, copySrcVkBuffer.DeviceBuffer, vkBuffer.DeviceBuffer, 1, ref copyRegion);
 
                 pool.EndAndSubmit(cb);
@@ -914,7 +1140,7 @@ namespace Veldrid.Vk
             }
         }
 
-        protected override void UpdateTextureCore(
+        private protected override void UpdateTextureCore(
             Texture texture,
             IntPtr source,
             uint sizeInBytes,
@@ -959,18 +1185,17 @@ namespace Veldrid.Vk
                     stagingTex, 0, 0, 0, 0, 0,
                     texture, x, y, z, mipLevel, arrayLayer,
                     width, height, depth, 1);
-                pool.EndAndSubmit(cb);
                 lock (_stagingResourcesLock)
                 {
                     _submittedStagingTextures.Add(cb, stagingTex);
                 }
+                pool.EndAndSubmit(cb);
             }
         }
 
         private VkTexture GetFreeStagingTexture(uint width, uint height, uint depth, PixelFormat format)
         {
-            uint pixelSize = FormatHelpers.GetSizeInBytes(format);
-            uint totalSize = width * height * depth * pixelSize;
+            uint totalSize = FormatHelpers.GetRegionSize(width, height, depth, format);
             lock (_stagingResourcesLock)
             {
                 for (int i = 0; i < _availableStagingTextures.Count; i++)
@@ -979,7 +1204,7 @@ namespace Veldrid.Vk
                     if (tex.Memory.Size >= totalSize)
                     {
                         _availableStagingTextures.RemoveAt(i);
-                        tex.SetStagingDimensions(width, height, depth);
+                        tex.SetStagingDimensions(width, height, depth, format);
                         return tex;
                     }
                 }
@@ -989,7 +1214,7 @@ namespace Veldrid.Vk
             uint texHeight = Math.Max(256, height);
             VkTexture newTex = (VkTexture)ResourceFactory.CreateTexture(TextureDescription.Texture3D(
                 texWidth, texHeight, depth, 1, format, TextureUsage.Staging));
-            newTex.SetStagingDimensions(width, height, depth);
+            newTex.SetStagingDimensions(width, height, depth, format);
 
             return newTex;
         }
@@ -1043,10 +1268,41 @@ namespace Veldrid.Vk
 
         internal static bool IsSupported()
         {
+            return s_isSupported.Value;
+        }
+
+        private static bool CheckIsSupported()
+        {
             if (!IsVulkanLoaded())
             {
                 return false;
             }
+
+            VkInstanceCreateInfo instanceCI = VkInstanceCreateInfo.New();
+            VkApplicationInfo applicationInfo = new VkApplicationInfo();
+            applicationInfo.apiVersion = new VkVersion(1, 0, 0);
+            applicationInfo.applicationVersion = new VkVersion(1, 0, 0);
+            applicationInfo.engineVersion = new VkVersion(1, 0, 0);
+            applicationInfo.pApplicationName = s_name;
+            applicationInfo.pEngineName = s_name;
+
+            instanceCI.pApplicationInfo = &applicationInfo;
+
+            VkResult result = vkCreateInstance(ref instanceCI, null, out VkInstance testInstance);
+            if (result != VkResult.Success)
+            {
+                return false;
+            }
+
+            uint physicalDeviceCount = 0;
+            result = vkEnumeratePhysicalDevices(testInstance, ref physicalDeviceCount, null);
+            if (result != VkResult.Success || physicalDeviceCount == 0)
+            {
+                vkDestroyInstance(testInstance, null);
+                return false;
+            }
+
+            vkDestroyInstance(testInstance, null);
 
             HashSet<string> instanceExtensions = new HashSet<string>(GetInstanceExtensions());
             if (!instanceExtensions.Contains(CommonStrings.VK_KHR_SURFACE_EXTENSION_NAME))
@@ -1059,7 +1315,25 @@ namespace Veldrid.Vk
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                return instanceExtensions.Contains(CommonStrings.VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+                if (RuntimeInformation.OSDescription.Contains("Unix")) // Android
+                {
+                    return instanceExtensions.Contains(CommonStrings.VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+                }
+                else
+                {
+                    return instanceExtensions.Contains(CommonStrings.VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+                }
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                if (RuntimeInformation.OSDescription.Contains("Darwin")) // macOS
+                {
+                    return instanceExtensions.Contains(CommonStrings.VK_MVK_MACOS_SURFACE_EXTENSION_NAME);
+                }
+                else // iOS
+                {
+                    return instanceExtensions.Contains(CommonStrings.VK_MVK_IOS_SURFACE_EXTENSION_NAME);
+                }
             }
 
             return false;
@@ -1077,17 +1351,21 @@ namespace Veldrid.Vk
             VkCommandBuffer cb = pool.BeginNewCommandBuffer();
             texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, texture.ArrayLayers, VkImageLayout.TransferDstOptimal);
             vkCmdClearColorImage(cb, texture.OptimalDeviceImage, VkImageLayout.TransferDstOptimal, &color, 1, &range);
+            texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, texture.ArrayLayers, VkImageLayout.ColorAttachmentOptimal);
             pool.EndAndSubmit(cb);
         }
 
         internal void ClearDepthTexture(VkTexture texture, VkClearDepthStencilValue clearValue)
         {
+            VkImageAspectFlags aspect = FormatHelpers.IsStencilFormat(texture.Format)
+                ? VkImageAspectFlags.Depth | VkImageAspectFlags.Stencil
+                : VkImageAspectFlags.Depth;
             VkImageSubresourceRange range = new VkImageSubresourceRange(
-                 VkImageAspectFlags.Depth | VkImageAspectFlags.Stencil,
-                 0,
-                 texture.MipLevels,
-                 0,
-                 texture.ArrayLayers);
+                aspect,
+                0,
+                texture.MipLevels,
+                0,
+                texture.ArrayLayers);
             SharedCommandPool pool = GetFreeCommandPool();
             VkCommandBuffer cb = pool.BeginNewCommandBuffer();
             texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, texture.ArrayLayers, VkImageLayout.TransferDstOptimal);
@@ -1098,6 +1376,21 @@ namespace Veldrid.Vk
                 &clearValue,
                 1,
                 &range);
+            texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, texture.ArrayLayers, VkImageLayout.DepthStencilAttachmentOptimal);
+            pool.EndAndSubmit(cb);
+        }
+
+        internal override uint GetUniformBufferMinOffsetAlignmentCore()
+            => (uint)_physicalDeviceProperties.limits.minUniformBufferOffsetAlignment;
+
+        internal override uint GetStructuredBufferMinOffsetAlignmentCore()
+            => (uint)_physicalDeviceProperties.limits.minStorageBufferOffsetAlignment;
+
+        internal void TransitionImageLayout(VkTexture texture, VkImageLayout layout)
+        {
+            SharedCommandPool pool = GetFreeCommandPool();
+            VkCommandBuffer cb = pool.BeginNewCommandBuffer();
+            texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, texture.ArrayLayers, layout);
             pool.EndAndSubmit(cb);
         }
 
@@ -1105,6 +1398,8 @@ namespace Veldrid.Vk
         {
             private readonly VkGraphicsDevice _gd;
             private readonly VkCommandPool _pool;
+            private readonly VkCommandBuffer _cb;
+
             public bool IsCached { get; }
 
             public SharedCommandPool(VkGraphicsDevice gd, bool isCached)
@@ -1113,27 +1408,27 @@ namespace Veldrid.Vk
                 IsCached = isCached;
 
                 VkCommandPoolCreateInfo commandPoolCI = VkCommandPoolCreateInfo.New();
-                commandPoolCI.flags = VkCommandPoolCreateFlags.Transient;
+                commandPoolCI.flags = VkCommandPoolCreateFlags.Transient | VkCommandPoolCreateFlags.ResetCommandBuffer;
                 commandPoolCI.queueFamilyIndex = _gd.GraphicsQueueIndex;
                 VkResult result = vkCreateCommandPool(_gd.Device, ref commandPoolCI, null, out _pool);
+                CheckResult(result);
+
+                VkCommandBufferAllocateInfo allocateInfo = VkCommandBufferAllocateInfo.New();
+                allocateInfo.commandBufferCount = 1;
+                allocateInfo.level = VkCommandBufferLevel.Primary;
+                allocateInfo.commandPool = _pool;
+                result = vkAllocateCommandBuffers(_gd.Device, ref allocateInfo, out _cb);
                 CheckResult(result);
             }
 
             public VkCommandBuffer BeginNewCommandBuffer()
             {
-                VkCommandBufferAllocateInfo allocateInfo = VkCommandBufferAllocateInfo.New();
-                allocateInfo.commandBufferCount = 1;
-                allocateInfo.level = VkCommandBufferLevel.Primary;
-                allocateInfo.commandPool = _pool;
-                VkResult result = vkAllocateCommandBuffers(_gd.Device, ref allocateInfo, out VkCommandBuffer cb);
-                CheckResult(result);
-
                 VkCommandBufferBeginInfo beginInfo = VkCommandBufferBeginInfo.New();
                 beginInfo.flags = VkCommandBufferUsageFlags.OneTimeSubmit;
-                result = vkBeginCommandBuffer(cb, ref beginInfo);
+                VkResult result = vkBeginCommandBuffer(_cb, ref beginInfo);
                 CheckResult(result);
 
-                return cb;
+                return _cb;
             }
 
             public void EndAndSubmit(VkCommandBuffer cb)
@@ -1147,15 +1442,22 @@ namespace Veldrid.Vk
                 }
             }
 
-            public void Reset()
-            {
-                VkResult result = vkResetCommandPool(_gd.Device, _pool, VkCommandPoolResetFlags.None);
-                CheckResult(result);
-            }
-
             internal void Destroy()
             {
                 vkDestroyCommandPool(_gd.Device, _pool, null);
+            }
+        }
+
+        private struct FenceSubmissionInfo
+        {
+            public Vulkan.VkFence Fence;
+            public VkCommandList CommandList;
+            public VkCommandBuffer CommandBuffer;
+            public FenceSubmissionInfo(Vulkan.VkFence fence, VkCommandList commandList, VkCommandBuffer commandBuffer)
+            {
+                Fence = fence;
+                CommandList = commandList;
+                CommandBuffer = commandBuffer;
             }
         }
     }
@@ -1166,10 +1468,17 @@ namespace Veldrid.Vk
         IntPtr allocatorPtr,
         out VkDebugReportCallbackEXT ret);
 
-    internal unsafe delegate VkResult vkDestroyDebugReportCallbackEXT_d(
+    internal unsafe delegate void vkDestroyDebugReportCallbackEXT_d(
         VkInstance instance,
         VkDebugReportCallbackEXT callback,
         VkAllocationCallbacks* pAllocator);
 
-    internal unsafe delegate VkResult vkDebugMarkerSetObjectNameEXT_d(VkDevice device, VkDebugMarkerObjectNameInfoEXT* pNameInfo);
+    internal unsafe delegate VkResult vkDebugMarkerSetObjectNameEXT_t(VkDevice device, VkDebugMarkerObjectNameInfoEXT* pNameInfo);
+    internal unsafe delegate void vkCmdDebugMarkerBeginEXT_t(VkCommandBuffer commandBuffer, VkDebugMarkerMarkerInfoEXT* pMarkerInfo);
+    internal unsafe delegate void vkCmdDebugMarkerEndEXT_t(VkCommandBuffer commandBuffer);
+    internal unsafe delegate void vkCmdDebugMarkerInsertEXT_t(VkCommandBuffer commandBuffer, VkDebugMarkerMarkerInfoEXT* pMarkerInfo);
+
+    internal unsafe delegate void vkGetBufferMemoryRequirements2_t(VkDevice device, VkBufferMemoryRequirementsInfo2KHR* pInfo, VkMemoryRequirements2KHR* pMemoryRequirements);
+    internal unsafe delegate void vkGetImageMemoryRequirements2_t(VkDevice device, VkImageMemoryRequirementsInfo2KHR* pInfo, VkMemoryRequirements2KHR* pMemoryRequirements);
+
 }

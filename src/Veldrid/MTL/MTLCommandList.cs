@@ -20,6 +20,7 @@ namespace Veldrid.MTL
         private RgbaFloat?[] _clearColors = Array.Empty<RgbaFloat?>();
         private (float depth, byte stencil)? _clearDepth;
         private MTLBuffer _indexBuffer;
+        private uint _ibOffset;
         private MTLIndexType _indexType;
         private new MTLPipeline _graphicsPipeline;
         private bool _graphicsPipelineChanged;
@@ -30,23 +31,24 @@ namespace Veldrid.MTL
         private MTLScissorRect[] _scissorRects = Array.Empty<MTLScissorRect>();
         private bool _scissorRectsChanged;
         private uint _graphicsResourceSetCount;
-        private ResourceSet[] _graphicsResourceSets;
+        private BoundResourceSetInfo[] _graphicsResourceSets;
         private bool[] _graphicsResourceSetsActive;
         private uint _computeResourceSetCount;
-        private ResourceSet[] _computeResourceSets;
+        private BoundResourceSetInfo[] _computeResourceSets;
         private bool[] _computeResourceSetsActive;
         private uint _vertexBufferCount;
+        private uint _nonVertexBufferCount;
         private MTLBuffer[] _vertexBuffers;
+        private uint[] _vbOffsets;
         private bool[] _vertexBuffersActive;
         private bool _disposed;
 
         public MTLCommandBuffer CommandBuffer => _cb;
 
         public MTLCommandList(ref CommandListDescription description, MTLGraphicsDevice gd)
-            : base(ref description)
+            : base(ref description, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
         {
             _gd = gd;
-            _cb = _gd.CommandQueue.commandBuffer();
         }
 
         public override string Name { get; set; }
@@ -54,23 +56,34 @@ namespace Veldrid.MTL
         public MTLCommandBuffer Commit()
         {
             _cb.commit();
-            return _cb;
+            MTLCommandBuffer ret = _cb;
+            _cb = default(MTLCommandBuffer);
+            return ret;
         }
 
         public override void Begin()
         {
-            ObjectiveCRuntime.release(_cb.NativePtr);
-            _cb = _gd.CommandQueue.commandBuffer();
+            if (_cb.NativePtr != IntPtr.Zero)
+            {
+                ObjectiveCRuntime.release(_cb.NativePtr);
+            }
+
+            using (NSAutoreleasePool.Begin())
+            {
+                _cb = _gd.CommandQueue.commandBuffer();
+                ObjectiveCRuntime.retain(_cb.NativePtr);
+            }
+
             ClearCachedState();
         }
 
-        protected override void ClearColorTargetCore(uint index, RgbaFloat clearColor)
+        private protected override void ClearColorTargetCore(uint index, RgbaFloat clearColor)
         {
             EnsureNoRenderPass();
             _clearColors[index] = clearColor;
         }
 
-        protected override void ClearDepthStencilCore(float depth, byte stencil)
+        private protected override void ClearDepthStencilCore(float depth, byte stencil)
         {
             EnsureNoRenderPass();
             _clearDepth = (depth, stencil);
@@ -84,34 +97,60 @@ namespace Veldrid.MTL
                 _computePipeline.ThreadsPerThreadgroup);
         }
 
-        protected override void DrawCore(uint vertexCount, uint instanceCount, uint vertexStart, uint instanceStart)
+        private protected override void DrawCore(uint vertexCount, uint instanceCount, uint vertexStart, uint instanceStart)
         {
             if (PreDrawCommand())
             {
-                _rce.drawPrimitives(
-                    _graphicsPipeline.PrimitiveType,
-                    (UIntPtr)vertexStart,
-                    (UIntPtr)vertexCount,
-                    (UIntPtr)instanceCount,
-                    (UIntPtr)instanceStart);
+                if (instanceStart == 0)
+                {
+                    _rce.drawPrimitives(
+                        _graphicsPipeline.PrimitiveType,
+                        (UIntPtr)vertexStart,
+                        (UIntPtr)vertexCount,
+                        (UIntPtr)instanceCount);
+                }
+                else
+                {
+                    _rce.drawPrimitives(
+                        _graphicsPipeline.PrimitiveType,
+                        (UIntPtr)vertexStart,
+                        (UIntPtr)vertexCount,
+                        (UIntPtr)instanceCount,
+                        (UIntPtr)instanceStart);
+
+                }
             }
         }
 
-        protected override void DrawIndexedCore(uint indexCount, uint instanceCount, uint indexStart, int vertexOffset, uint instanceStart)
+        private protected override void DrawIndexedCore(uint indexCount, uint instanceCount, uint indexStart, int vertexOffset, uint instanceStart)
         {
             if (PreDrawCommand())
             {
                 uint indexSize = _indexType == MTLIndexType.UInt16 ? 2u : 4u;
-                uint indexBufferOffset = indexSize * indexStart;
-                _rce.drawIndexedPrimitives(
-                    _graphicsPipeline.PrimitiveType,
-                    (UIntPtr)indexCount,
-                    _indexType,
-                    _indexBuffer.DeviceBuffer,
-                    (UIntPtr)indexBufferOffset,
-                    (UIntPtr)instanceCount,
-                    (IntPtr)vertexOffset,
-                    (UIntPtr)instanceStart);
+                uint indexBufferOffset = (indexSize * indexStart) + _ibOffset;
+
+                if (vertexOffset == 0 && instanceStart == 0)
+                {
+                    _rce.drawIndexedPrimitives(
+                        _graphicsPipeline.PrimitiveType,
+                        (UIntPtr)indexCount,
+                        _indexType,
+                        _indexBuffer.DeviceBuffer,
+                        (UIntPtr)indexBufferOffset,
+                        (UIntPtr)instanceCount);
+                }
+                else
+                {
+                    _rce.drawIndexedPrimitives(
+                        _graphicsPipeline.PrimitiveType,
+                        (UIntPtr)indexCount,
+                        _indexType,
+                        _indexBuffer.DeviceBuffer,
+                        (UIntPtr)indexBufferOffset,
+                        (UIntPtr)instanceCount,
+                        (IntPtr)vertexOffset,
+                        (UIntPtr)instanceStart);
+                }
             }
         }
         private bool PreDrawCommand()
@@ -120,18 +159,12 @@ namespace Veldrid.MTL
             {
                 if (_viewportsChanged)
                 {
-                    fixed (MTLViewport* viewportsPtr = &_viewports[0])
-                    {
-                        _rce.setViewports(viewportsPtr, (UIntPtr)_viewportCount);
-                    }
+                    FlushViewports();
                     _viewportsChanged = false;
                 }
                 if (_scissorRectsChanged && _graphicsPipeline.ScissorTestEnabled)
                 {
-                    fixed (MTLScissorRect* scissorRectsPtr = &_scissorRects[0])
-                    {
-                        _rce.setScissorRects(scissorRectsPtr, (UIntPtr)_viewportCount);
-                    }
+                    FlushScissorRects();
                     _scissorRectsChanged = false;
                 }
                 if (_graphicsPipelineChanged)
@@ -140,6 +173,7 @@ namespace Veldrid.MTL
                     _rce.setRenderPipelineState(_graphicsPipeline.RenderPipelineState);
                     _rce.setCullMode(_graphicsPipeline.CullMode);
                     _rce.setFrontFacing(_graphicsPipeline.FrontFace);
+                    _rce.setTriangleFillMode(_graphicsPipeline.FillMode);
                     RgbaFloat blendColor = _graphicsPipeline.BlendColor;
                     _rce.setBlendColor(blendColor.R, blendColor.G, blendColor.B, blendColor.A);
                     if (_framebuffer.DepthTarget != null)
@@ -163,7 +197,13 @@ namespace Veldrid.MTL
                 {
                     if (!_vertexBuffersActive[i])
                     {
-                        _rce.setVertexBuffer(_vertexBuffers[i].DeviceBuffer, UIntPtr.Zero, (UIntPtr)i);
+                        UIntPtr index = (UIntPtr)(_graphicsPipeline.ResourceBindingModel == ResourceBindingModel.Improved
+                            ? _nonVertexBufferCount + i
+                            : i);
+                        _rce.setVertexBuffer(
+                            _vertexBuffers[i].DeviceBuffer,
+                            (UIntPtr)_vbOffsets[i],
+                            index);
                     }
                 }
                 return true;
@@ -171,6 +211,36 @@ namespace Veldrid.MTL
             return false;
         }
 
+
+        private void FlushViewports()
+        {
+            if (_gd.MetalFeatures.IsSupported(MTLFeatureSet.macOS_GPUFamily1_v3))
+            {
+                fixed (MTLViewport* viewportsPtr = &_viewports[0])
+                {
+                    _rce.setViewports(viewportsPtr, (UIntPtr)_viewportCount);
+                }
+            }
+            else
+            {
+                _rce.setViewport(_viewports[0]);
+            }
+        }
+
+        private void FlushScissorRects()
+        {
+            if (_gd.MetalFeatures.IsSupported(MTLFeatureSet.macOS_GPUFamily1_v3))
+            {
+                fixed (MTLScissorRect* scissorRectsPtr = &_scissorRects[0])
+                {
+                    _rce.setScissorRects(scissorRectsPtr, (UIntPtr)_viewportCount);
+                }
+            }
+            else
+            {
+                _rce.setScissorRect(_scissorRects[0]);
+            }
+        }
 
         private void PreComputeCommand()
         {
@@ -193,6 +263,7 @@ namespace Veldrid.MTL
         public override void End()
         {
             EnsureNoBlitEncoder();
+            EnsureNoComputeEncoder();
 
             if (!_currentFramebufferEverActive && _mtlFramebuffer != null)
             {
@@ -201,7 +272,7 @@ namespace Veldrid.MTL
             EnsureNoRenderPass();
         }
 
-        protected override void SetPipelineCore(Pipeline pipeline)
+        private protected override void SetPipelineCore(Pipeline pipeline)
         {
             if (pipeline.IsComputePipeline)
             {
@@ -209,7 +280,6 @@ namespace Veldrid.MTL
                 _computeResourceSetCount = (uint)_computePipeline.ResourceLayouts.Length;
                 Util.EnsureArrayMinimumSize(ref _computeResourceSets, _computeResourceSetCount);
                 Util.EnsureArrayMinimumSize(ref _computeResourceSetsActive, _computeResourceSetCount);
-                Util.ClearArray(_computeResourceSets);
                 Util.ClearArray(_computeResourceSetsActive);
                 _computePipelineChanged = true;
             }
@@ -219,11 +289,13 @@ namespace Veldrid.MTL
                 _graphicsResourceSetCount = (uint)_graphicsPipeline.ResourceLayouts.Length;
                 Util.EnsureArrayMinimumSize(ref _graphicsResourceSets, _graphicsResourceSetCount);
                 Util.EnsureArrayMinimumSize(ref _graphicsResourceSetsActive, _graphicsResourceSetCount);
-                Util.ClearArray(_graphicsResourceSets);
                 Util.ClearArray(_graphicsResourceSetsActive);
+
+                _nonVertexBufferCount = _graphicsPipeline.NonVertexBufferCount;
 
                 _vertexBufferCount = _graphicsPipeline.VertexBufferCount;
                 Util.EnsureArrayMinimumSize(ref _vertexBuffers, _vertexBufferCount);
+                Util.EnsureArrayMinimumSize(ref _vbOffsets, _vertexBufferCount);
                 Util.EnsureArrayMinimumSize(ref _vertexBuffersActive, _vertexBufferCount);
                 Util.ClearArray(_vertexBuffersActive);
 
@@ -249,31 +321,32 @@ namespace Veldrid.MTL
                 viewport.MaxDepth);
         }
 
-        public override void UpdateBuffer(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
+        private protected override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
         {
-            if (bufferOffsetInBytes % 4 != 0)
-            {
-                throw new VeldridException("Metal needs 4-byte-multiple buffer copy size and offset.");
-            }
-            if (sizeInBytes % 4 != 0 && bufferOffsetInBytes != 0 && sizeInBytes != buffer.SizeInBytes)
-            {
-                throw new VeldridException("Metal needs 4-byte-multiple buffer copy size and offset.");
-            }
-
-            Debug.Assert(bufferOffsetInBytes % 4 == 0);
-
-            uint sizeRoundFactor = (4 - (sizeInBytes % 4)) % 4;
+            bool useComputeCopy = (bufferOffsetInBytes % 4 != 0)
+                || (sizeInBytes % 4 != 0 && bufferOffsetInBytes != 0 && sizeInBytes != buffer.SizeInBytes);
 
             MTLBuffer dstMTLBuffer = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(buffer);
             // TODO: Cache these, and rely on the command buffer's completion callback to add them back to a shared pool.
             MTLBuffer copySrc = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(
                 _gd.ResourceFactory.CreateBuffer(new BufferDescription(sizeInBytes, BufferUsage.Staging)));
             _gd.UpdateBuffer(copySrc, 0, source, sizeInBytes);
-            EnsureBlitEncoder();
-            _bce.copy(
-                copySrc.DeviceBuffer, UIntPtr.Zero,
-                dstMTLBuffer.DeviceBuffer, (UIntPtr)bufferOffsetInBytes,
-                (UIntPtr)(sizeInBytes + sizeRoundFactor));
+
+            if (useComputeCopy)
+            {
+                CopyBufferCore(copySrc, 0, buffer, bufferOffsetInBytes, sizeInBytes);
+            }
+            else
+            {
+                Debug.Assert(bufferOffsetInBytes % 4 == 0);
+                uint sizeRoundFactor = (4 - (sizeInBytes % 4)) % 4;
+                EnsureBlitEncoder();
+                _bce.copy(
+                    copySrc.DeviceBuffer, UIntPtr.Zero,
+                    dstMTLBuffer.DeviceBuffer, (UIntPtr)bufferOffsetInBytes,
+                    (UIntPtr)(sizeInBytes + sizeRoundFactor));
+            }
+
             copySrc.Dispose();
         }
 
@@ -284,18 +357,33 @@ namespace Veldrid.MTL
             uint destinationOffset,
             uint sizeInBytes)
         {
-            if (sourceOffset % 4 != 0 || sizeInBytes % 4 != 0)
-            {
-                throw new NotImplementedException("Metal needs 4-byte-multiple buffer copy size and offset.");
-            }
-
-            EnsureBlitEncoder();
             MTLBuffer mtlSrc = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(source);
             MTLBuffer mtlDst = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(destination);
-            _bce.copy(
-                mtlSrc.DeviceBuffer, (UIntPtr)sourceOffset,
-                mtlDst.DeviceBuffer, (UIntPtr)destinationOffset,
-                (UIntPtr)sizeInBytes);
+
+            if (sourceOffset % 4 != 0 || destinationOffset % 4 != 0 || sizeInBytes % 4 != 0)
+            {
+                // Unaligned copy -- use special compute shader.
+                EnsureComputeEncoder();
+                _cce.setComputePipelineState(_gd.GetUnalignedBufferCopyPipeline());
+                _cce.setBuffer(mtlSrc.DeviceBuffer, UIntPtr.Zero, (UIntPtr)0);
+                _cce.setBuffer(mtlDst.DeviceBuffer, UIntPtr.Zero, (UIntPtr)1);
+
+                MTLUnalignedBufferCopyInfo copyInfo;
+                copyInfo.SourceOffset = sourceOffset;
+                copyInfo.DestinationOffset = destinationOffset;
+                copyInfo.CopySize = sizeInBytes;
+
+                _cce.setBytes(&copyInfo, (UIntPtr)sizeof(MTLUnalignedBufferCopyInfo), (UIntPtr)2);
+                _cce.dispatchThreadGroups(new MTLSize(1, 1, 1), new MTLSize(1, 1, 1));
+            }
+            else
+            {
+                EnsureBlitEncoder();
+                _bce.copy(
+                    mtlSrc.DeviceBuffer, (UIntPtr)sourceOffset,
+                    mtlDst.DeviceBuffer, (UIntPtr)destinationOffset,
+                    (UIntPtr)sizeInBytes);
+            }
         }
 
         protected override void CopyTextureCore(
@@ -315,9 +403,9 @@ namespace Veldrid.MTL
                 MetalBindings.MTLBuffer srcBuffer = srcMTLTexture.StagingBuffer;
                 MetalBindings.MTLTexture dstTexture = dstMTLTexture.DeviceTexture;
 
+                Util.GetMipDimensions(srcMTLTexture, srcMipLevel, out uint mipWidth, out uint mipHeight, out uint mipDepth);
                 for (uint layer = 0; layer < layerCount; layer++)
                 {
-                    Util.GetMipDimensions(srcMTLTexture, srcMipLevel, out uint mipWidth, out uint mipHeight, out uint mipDepth);
                     uint blockSize = FormatHelpers.IsCompressedFormat(srcMTLTexture.Format) ? 4u : 1u;
                     uint compressedSrcX = srcX / blockSize;
                     uint compressedSrcY = srcY / blockSize;
@@ -339,7 +427,15 @@ namespace Veldrid.MTL
                         + srcRowPitch * compressedSrcY
                         + blockSizeInBytes * compressedSrcX;
 
-                    MTLSize sourceSize = new MTLSize(width, height, depth);
+                    uint copyWidth = width > mipWidth && width <= blockSize
+                        ? mipWidth
+                        : width;
+
+                    uint copyHeight = height > mipHeight && height <= blockSize
+                        ? mipHeight
+                        : height;
+
+                    MTLSize sourceSize = new MTLSize(copyWidth, copyHeight, depth);
                     if (dstMTLTexture.Type != TextureType.Texture3D)
                     {
                         srcDepthPitch = 0;
@@ -441,6 +537,7 @@ namespace Veldrid.MTL
             }
             else if (!srcIsStaging && dstIsStaging)
             {
+                // Normal -> Staging
                 MTLOrigin srcOrigin = new MTLOrigin(srcX, srcY, srcZ);
                 MTLSize srcSize = new MTLSize(width, height, depth);
                 for (uint layer = 0; layer < layerCount; layer++)
@@ -450,7 +547,23 @@ namespace Veldrid.MTL
                         dstBaseArrayLayer + layer,
                         out uint dstBytesPerRow,
                         out uint dstBytesPerImage);
-                    ulong dstOffset = Util.ComputeSubresourceOffset(dstMTLTexture, dstMipLevel, dstBaseArrayLayer + layer);
+
+                    Util.GetMipDimensions(srcMTLTexture, dstMipLevel, out uint mipWidth, out uint mipHeight, out uint mipDepth);
+                    uint blockSize = FormatHelpers.IsCompressedFormat(srcMTLTexture.Format) ? 4u : 1u;
+                    uint bufferRowLength = Math.Max(mipWidth, blockSize);
+                    uint bufferImageHeight = Math.Max(mipHeight, blockSize);
+                    uint compressedDstX = dstX / blockSize;
+                    uint compressedDstY = dstY / blockSize;
+                    uint blockSizeInBytes = blockSize == 1
+                        ? FormatHelpers.GetSizeInBytes(srcMTLTexture.Format)
+                        : FormatHelpers.GetBlockSizeInBytes(srcMTLTexture.Format);
+                    uint rowPitch = FormatHelpers.GetRowPitch(bufferRowLength, srcMTLTexture.Format);
+                    uint depthPitch = FormatHelpers.GetDepthPitch(rowPitch, bufferImageHeight, srcMTLTexture.Format);
+
+                    ulong dstOffset = Util.ComputeSubresourceOffset(dstMTLTexture, dstMipLevel, dstBaseArrayLayer + layer)
+                        + (dstZ * depthPitch)
+                        + (compressedDstY * rowPitch)
+                        + (compressedDstX * blockSizeInBytes);
 
                     _bce.copyTextureToBuffer(
                         srcMTLTexture.DeviceTexture,
@@ -464,6 +577,31 @@ namespace Veldrid.MTL
                         (UIntPtr)dstBytesPerImage);
                 }
             }
+            else
+            {
+                // Normal -> Normal
+                for (uint layer = 0; layer < layerCount; layer++)
+                {
+                    _bce.copyFromTexture(
+                        srcMTLTexture.DeviceTexture,
+                        (UIntPtr)(srcBaseArrayLayer + layer),
+                        (UIntPtr)srcMipLevel,
+                        new MTLOrigin(srcX, srcY, srcZ),
+                        new MTLSize(width, height, depth),
+                        dstMTLTexture.DeviceTexture,
+                        (UIntPtr)(dstBaseArrayLayer + layer),
+                        (UIntPtr)dstMipLevel,
+                        new MTLOrigin(dstX, dstY, dstZ));
+                }
+            }
+        }
+
+        private protected override void GenerateMipmapsCore(Texture texture)
+        {
+            Debug.Assert(texture.MipLevels > 1);
+            EnsureBlitEncoder();
+            MTLTexture mtlTex = Util.AssertSubtype<Texture, MTLTexture>(texture);
+            _bce.generateMipmapsForTexture(mtlTex.DeviceTexture);
         }
 
         protected override void DispatchIndirectCore(DeviceBuffer indirectBuffer, uint offset)
@@ -488,7 +626,7 @@ namespace Veldrid.MTL
                         _graphicsPipeline.PrimitiveType,
                         _indexType,
                         _indexBuffer.DeviceBuffer,
-                        UIntPtr.Zero,
+                        (UIntPtr)_ibOffset,
                         mtlBuffer.DeviceBuffer,
                         (UIntPtr)currentOffset);
                 }
@@ -517,22 +655,30 @@ namespace Veldrid.MTL
             MTLTexture mtlSrc = Util.AssertSubtype<Texture, MTLTexture>(source);
             MTLTexture mtlDst = Util.AssertSubtype<Texture, MTLTexture>(destination);
 
-            MTLRenderPassDescriptor rpDesc = MTLUtil.AllocInit<MTLRenderPassDescriptor>();
+            MTLRenderPassDescriptor rpDesc = MTLRenderPassDescriptor.New();
             var colorAttachment = rpDesc.colorAttachments[0];
             colorAttachment.texture = mtlSrc.DeviceTexture;
             colorAttachment.loadAction = MTLLoadAction.Load;
             colorAttachment.storeAction = MTLStoreAction.MultisampleResolve;
             colorAttachment.resolveTexture = mtlDst.DeviceTexture;
 
-            MTLRenderCommandEncoder encoder = _cb.renderCommandEncoderWithDescriptor(rpDesc);
-            encoder.endEncoding();
-            ObjectiveCRuntime.release(encoder.NativePtr);
+            using (NSAutoreleasePool.Begin())
+            {
+                MTLRenderCommandEncoder encoder = _cb.renderCommandEncoderWithDescriptor(rpDesc);
+                encoder.endEncoding();
+            }
+
+            ObjectiveCRuntime.release(rpDesc.NativePtr);
         }
 
-        protected override void SetComputeResourceSetCore(uint slot, ResourceSet set)
+        protected override void SetComputeResourceSetCore(uint slot, ResourceSet set, uint dynamicOffsetCount, ref uint dynamicOffsets)
         {
-            _computeResourceSets[slot] = set;
-            _computeResourceSetsActive[slot] = false;
+            if (!_computeResourceSets[slot].Equals(set, dynamicOffsetCount, ref dynamicOffsets))
+            {
+                _computeResourceSets[slot].Offsets.Dispose();
+                _computeResourceSets[slot] = new BoundResourceSetInfo(set, dynamicOffsetCount, ref dynamicOffsets);
+                _computeResourceSetsActive[slot] = false;
+            }
         }
 
         protected override void SetFramebufferCore(Framebuffer fb)
@@ -558,34 +704,49 @@ namespace Veldrid.MTL
             _currentFramebufferEverActive = false;
         }
 
-        protected override void SetGraphicsResourceSetCore(uint slot, ResourceSet rs)
+        protected override void SetGraphicsResourceSetCore(uint slot, ResourceSet rs, uint dynamicOffsetCount, ref uint dynamicOffsets)
         {
-            _graphicsResourceSets[slot] = rs;
-            _graphicsResourceSetsActive[slot] = false;
+            if (!_graphicsResourceSets[slot].Equals(rs, dynamicOffsetCount, ref dynamicOffsets))
+            {
+                _graphicsResourceSets[slot].Offsets.Dispose();
+                _graphicsResourceSets[slot] = new BoundResourceSetInfo(rs, dynamicOffsetCount, ref dynamicOffsets);
+                _graphicsResourceSetsActive[slot] = false;
+            }
         }
 
-        private void ActivateGraphicsResourceSet(uint slot, ResourceSet rs)
+        private void ActivateGraphicsResourceSet(uint slot, BoundResourceSetInfo brsi)
         {
             Debug.Assert(RenderEncoderActive);
-            MTLResourceSet mtlRS = Util.AssertSubtype<ResourceSet, MTLResourceSet>(rs);
+            MTLResourceSet mtlRS = Util.AssertSubtype<ResourceSet, MTLResourceSet>(brsi.Set);
             MTLResourceLayout layout = mtlRS.Layout;
+            uint dynamicOffsetIndex = 0;
 
             for (int i = 0; i < mtlRS.Resources.Length; i++)
             {
-                var bindingInfo = layout.GetBindingInfo(i);
-                var resource = mtlRS.Resources[i];
+                MTLResourceLayout.ResourceBindingInfo bindingInfo = layout.GetBindingInfo(i);
+                BindableResource resource = mtlRS.Resources[i];
+                uint bufferOffset = 0;
+                if (bindingInfo.DynamicBuffer)
+                {
+                    bufferOffset = brsi.Offsets.Get(dynamicOffsetIndex);
+                    dynamicOffsetIndex += 1;
+                }
                 switch (bindingInfo.Kind)
                 {
                     case ResourceKind.UniformBuffer:
-                        MTLBuffer mtlBuffer = Util.AssertSubtype<BindableResource, MTLBuffer>(resource);
-                        BindBuffer(mtlBuffer, slot, bindingInfo.Slot, bindingInfo.Stages);
+                    {
+                        DeviceBufferRange range = Util.GetBufferRange(resource, bufferOffset);
+                        BindBuffer(range, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
+                    }
                     case ResourceKind.TextureReadOnly:
-                        MTLTextureView mtlTexView = Util.AssertSubtype<BindableResource, MTLTextureView>(resource);
+                        TextureView texView = Util.GetTextureView(_gd, resource);
+                        MTLTextureView mtlTexView = Util.AssertSubtype<TextureView, MTLTextureView>(texView);
                         BindTexture(mtlTexView, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
                     case ResourceKind.TextureReadWrite:
-                        MTLTextureView mtlTexViewRW = Util.AssertSubtype<BindableResource, MTLTextureView>(resource);
+                        TextureView texViewRW = Util.GetTextureView(_gd, resource);
+                        MTLTextureView mtlTexViewRW = Util.AssertSubtype<TextureView, MTLTextureView>(texViewRW);
                         BindTexture(mtlTexViewRW, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
                     case ResourceKind.Sampler:
@@ -593,41 +754,57 @@ namespace Veldrid.MTL
                         BindSampler(mtlSampler, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
                     case ResourceKind.StructuredBufferReadOnly:
-                        MTLBuffer mtlStructuredBuff = Util.AssertSubtype<BindableResource, MTLBuffer>(resource);
-                        BindBuffer(mtlStructuredBuff, slot, bindingInfo.Slot, bindingInfo.Stages);
+                    {
+                        DeviceBufferRange range = Util.GetBufferRange(resource, bufferOffset);
+                        BindBuffer(range, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
+                    }
                     case ResourceKind.StructuredBufferReadWrite:
-                        MTLBuffer mtlStructuredBuffRW = Util.AssertSubtype<BindableResource, MTLBuffer>(resource);
-                        BindBuffer(mtlStructuredBuffRW, slot, bindingInfo.Slot, bindingInfo.Stages);
+                    {
+                        DeviceBufferRange range = Util.GetBufferRange(resource, bufferOffset);
+                        BindBuffer(range, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
+                    }
                     default:
                         throw Illegal.Value<ResourceKind>();
                 }
             }
         }
 
-        private void ActivateComputeResourceSet(uint slot, ResourceSet rs)
+        private void ActivateComputeResourceSet(uint slot, BoundResourceSetInfo brsi)
         {
             Debug.Assert(ComputeEncoderActive);
-            MTLResourceSet mtlRS = Util.AssertSubtype<ResourceSet, MTLResourceSet>(rs);
+            MTLResourceSet mtlRS = Util.AssertSubtype<ResourceSet, MTLResourceSet>(brsi.Set);
             MTLResourceLayout layout = mtlRS.Layout;
+            uint dynamicOffsetIndex = 0;
 
             for (int i = 0; i < mtlRS.Resources.Length; i++)
             {
-                var bindingInfo = layout.GetBindingInfo(i);
-                var resource = mtlRS.Resources[i];
+                MTLResourceLayout.ResourceBindingInfo bindingInfo = layout.GetBindingInfo(i);
+                BindableResource resource = mtlRS.Resources[i];
+                uint bufferOffset = 0;
+                if (bindingInfo.DynamicBuffer)
+                {
+                    bufferOffset = brsi.Offsets.Get(dynamicOffsetIndex);
+                    dynamicOffsetIndex += 1;
+                }
+
                 switch (bindingInfo.Kind)
                 {
                     case ResourceKind.UniformBuffer:
-                        MTLBuffer mtlBuffer = Util.AssertSubtype<BindableResource, MTLBuffer>(resource);
-                        BindBuffer(mtlBuffer, slot, bindingInfo.Slot, bindingInfo.Stages);
+                    {
+                        DeviceBufferRange range = Util.GetBufferRange(resource, bufferOffset);
+                        BindBuffer(range, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
+                    }
                     case ResourceKind.TextureReadOnly:
-                        MTLTextureView mtlTexView = Util.AssertSubtype<BindableResource, MTLTextureView>(resource);
+                        TextureView texView = Util.GetTextureView(_gd, resource);
+                        MTLTextureView mtlTexView = Util.AssertSubtype<TextureView, MTLTextureView>(texView);
                         BindTexture(mtlTexView, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
                     case ResourceKind.TextureReadWrite:
-                        MTLTextureView mtlTexViewRW = Util.AssertSubtype<BindableResource, MTLTextureView>(resource);
+                        TextureView texViewRW = Util.GetTextureView(_gd, resource);
+                        MTLTextureView mtlTexViewRW = Util.AssertSubtype<TextureView, MTLTextureView>(texViewRW);
                         BindTexture(mtlTexViewRW, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
                     case ResourceKind.Sampler:
@@ -635,36 +812,43 @@ namespace Veldrid.MTL
                         BindSampler(mtlSampler, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
                     case ResourceKind.StructuredBufferReadOnly:
-                        MTLBuffer mtlStructuredBuff = Util.AssertSubtype<BindableResource, MTLBuffer>(resource);
-                        BindBuffer(mtlStructuredBuff, slot, bindingInfo.Slot, bindingInfo.Stages);
+                    {
+                        DeviceBufferRange range = Util.GetBufferRange(resource, bufferOffset);
+                        BindBuffer(range, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
+                    }
                     case ResourceKind.StructuredBufferReadWrite:
-                        MTLBuffer mtlStructuredBuffRW = Util.AssertSubtype<BindableResource, MTLBuffer>(resource);
-                        BindBuffer(mtlStructuredBuffRW, slot, bindingInfo.Slot, bindingInfo.Stages);
+                    {
+                        DeviceBufferRange range = Util.GetBufferRange(resource, bufferOffset);
+                        BindBuffer(range, slot, bindingInfo.Slot, bindingInfo.Stages);
                         break;
+                    }
                     default:
                         throw Illegal.Value<ResourceKind>();
                 }
             }
         }
 
-        private void BindBuffer(MTLBuffer mtlBuffer, uint set, uint slot, ShaderStages stages)
+        private void BindBuffer(DeviceBufferRange range, uint set, uint slot, ShaderStages stages)
         {
+            MTLBuffer mtlBuffer = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(range.Buffer);
             uint baseBuffer = GetBufferBase(set, stages != ShaderStages.Compute);
             if (stages == ShaderStages.Compute)
             {
-                _cce.setBuffer(mtlBuffer.DeviceBuffer, UIntPtr.Zero, (UIntPtr)(slot + baseBuffer));
+                _cce.setBuffer(mtlBuffer.DeviceBuffer, (UIntPtr)range.Offset, (UIntPtr)(slot + baseBuffer));
             }
             else
             {
                 if ((stages & ShaderStages.Vertex) == ShaderStages.Vertex)
                 {
-                    uint vertexBufferCount = _graphicsPipeline.VertexBufferCount;
-                    _rce.setVertexBuffer(mtlBuffer.DeviceBuffer, UIntPtr.Zero, (UIntPtr)(slot + vertexBufferCount + baseBuffer));
+                    UIntPtr index = (UIntPtr)(_graphicsPipeline.ResourceBindingModel == ResourceBindingModel.Improved
+                        ? slot + baseBuffer
+                        : slot + _vertexBufferCount + baseBuffer);
+                    _rce.setVertexBuffer(mtlBuffer.DeviceBuffer, (UIntPtr)range.Offset, index);
                 }
                 if ((stages & ShaderStages.Fragment) == ShaderStages.Fragment)
                 {
-                    _rce.setFragmentBuffer(mtlBuffer.DeviceBuffer, UIntPtr.Zero, (UIntPtr)(slot + baseBuffer));
+                    _rce.setFragmentBuffer(mtlBuffer.DeviceBuffer, (UIntPtr)range.Offset, (UIntPtr)(slot + baseBuffer));
                 }
             }
         }
@@ -761,7 +945,7 @@ namespace Veldrid.MTL
                 return false;
             }
 
-            var rpDesc = _mtlFramebuffer.CreateRenderPassDescriptor();
+            MTLRenderPassDescriptor rpDesc = _mtlFramebuffer.CreateRenderPassDescriptor();
             for (uint i = 0; i < _clearColors.Length; i++)
             {
                 if (_clearColors[i] != null)
@@ -790,7 +974,12 @@ namespace Veldrid.MTL
                 _clearDepth = null;
             }
 
-            _rce = _cb.renderCommandEncoderWithDescriptor(rpDesc);
+            using (NSAutoreleasePool.Begin())
+            {
+                _rce = _cb.renderCommandEncoderWithDescriptor(rpDesc);
+                ObjectiveCRuntime.retain(_rce.NativePtr);
+            }
+
             ObjectiveCRuntime.release(rpDesc.NativePtr);
             _currentFramebufferEverActive = true;
 
@@ -824,7 +1013,11 @@ namespace Veldrid.MTL
             {
                 EnsureNoRenderPass();
                 EnsureNoComputeEncoder();
-                _bce = _cb.blitCommandEncoder();
+                using (NSAutoreleasePool.Begin())
+                {
+                    _bce = _cb.blitCommandEncoder();
+                    ObjectiveCRuntime.retain(_bce.NativePtr);
+                }
             }
 
             Debug.Assert(BlitEncoderActive);
@@ -851,7 +1044,11 @@ namespace Veldrid.MTL
                 EnsureNoBlitEncoder();
                 EnsureNoRenderPass();
 
-                _cce = _cb.computeCommandEncoder();
+                using (NSAutoreleasePool.Begin())
+                {
+                    _cce = _cb.computeCommandEncoder();
+                    ObjectiveCRuntime.retain(_cce.NativePtr);
+                }
             }
 
             Debug.Assert(ComputeEncoderActive);
@@ -873,22 +1070,79 @@ namespace Veldrid.MTL
             Debug.Assert(!ComputeEncoderActive);
         }
 
-        protected override void SetIndexBufferCore(DeviceBuffer buffer, IndexFormat format)
+        private protected override void SetIndexBufferCore(DeviceBuffer buffer, IndexFormat format, uint offset)
         {
             _indexBuffer = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(buffer);
+            _ibOffset = offset;
             _indexType = MTLFormats.VdToMTLIndexFormat(format);
         }
 
-        protected override void SetVertexBufferCore(uint index, DeviceBuffer buffer)
+        private protected override void SetVertexBufferCore(uint index, DeviceBuffer buffer, uint offset)
         {
             Util.EnsureArrayMinimumSize(ref _vertexBuffers, index + 1);
+            Util.EnsureArrayMinimumSize(ref _vbOffsets, index + 1);
             Util.EnsureArrayMinimumSize(ref _vertexBuffersActive, index + 1);
-            if (_vertexBuffers[index] != buffer)
+            if (_vertexBuffers[index] != buffer || _vbOffsets[index] != offset)
             {
-                var mtlBuffer = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(buffer);
+                MTLBuffer mtlBuffer = Util.AssertSubtype<DeviceBuffer, MTLBuffer>(buffer);
                 _vertexBuffers[index] = mtlBuffer;
+                _vbOffsets[index] = offset;
                 _vertexBuffersActive[index] = false;
             }
+        }
+
+        private protected override void PushDebugGroupCore(string name)
+        {
+            NSString nsName = NSString.New(name);
+            if (!_bce.IsNull)
+            {
+                _bce.pushDebugGroup(nsName);
+            }
+            else if (!_cce.IsNull)
+            {
+                _cce.pushDebugGroup(nsName);
+            }
+            else if (!_rce.IsNull)
+            {
+                _rce.pushDebugGroup(nsName);
+            }
+
+            ObjectiveCRuntime.release(nsName);
+        }
+
+        private protected override void PopDebugGroupCore()
+        {
+            if (!_bce.IsNull)
+            {
+                _bce.popDebugGroup();
+            }
+            else if (!_cce.IsNull)
+            {
+                _cce.popDebugGroup();
+            }
+            else if (!_rce.IsNull)
+            {
+                _rce.popDebugGroup();
+            }
+        }
+
+        private protected override void InsertDebugMarkerCore(string name)
+        {
+            NSString nsName = NSString.New(name);
+            if (!_bce.IsNull)
+            {
+                _bce.insertDebugSignpost(nsName);
+            }
+            else if (!_cce.IsNull)
+            {
+                _cce.insertDebugSignpost(nsName);
+            }
+            else if (!_rce.IsNull)
+            {
+                _rce.insertDebugSignpost(nsName);
+            }
+
+            ObjectiveCRuntime.release(nsName);
         }
 
         public override void Dispose()
@@ -897,7 +1151,10 @@ namespace Veldrid.MTL
             {
                 _disposed = true;
                 EnsureNoRenderPass();
-                ObjectiveCRuntime.release(_cb.NativePtr);
+                if (_cb.NativePtr != IntPtr.Zero)
+                {
+                    ObjectiveCRuntime.release(_cb.NativePtr);
+                }
             }
         }
     }

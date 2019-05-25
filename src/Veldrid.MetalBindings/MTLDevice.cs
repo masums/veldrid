@@ -13,7 +13,20 @@ namespace Veldrid.MetalBindings
         public MTLDevice(IntPtr nativePtr) => NativePtr = nativePtr;
 
         public string name => string_objc_msgSend(NativePtr, sel_name);
-        public MTLSize maxThreadsPerThreadgroup => objc_msgSend_stret<MTLSize>(this, sel_maxThreadsPerThreadgroup);
+        public MTLSize maxThreadsPerThreadgroup
+        {
+            get
+            {
+                if (UseStret<MTLSize>())
+                {
+                    return objc_msgSend_stret<MTLSize>(this, sel_maxThreadsPerThreadgroup);
+                }
+                else
+                {
+                    return MTLSize_objc_msgSend(this, sel_maxThreadsPerThreadgroup);
+                }
+            }
+        }
 
         public MTLLibrary newLibraryWithSource(string source, MTLCompileOptions options)
         {
@@ -23,6 +36,8 @@ namespace Veldrid.MetalBindings
                 sourceNSS,
                 options,
                 out NSError error);
+
+            release(sourceNSS.NativePtr);
 
             if (library == IntPtr.Zero)
             {
@@ -112,6 +127,9 @@ namespace Veldrid.MetalBindings
 
         [DllImport(MetalFramework)]
         public static extern MTLDevice MTLCreateSystemDefaultDevice();
+
+        [DllImport(MetalFramework)]
+        public static extern NSArray MTLCopyAllDevices();
 
         private static readonly Selector sel_name = "name";
         private static readonly Selector sel_maxThreadsPerThreadgroup = "maxThreadsPerThreadgroup";

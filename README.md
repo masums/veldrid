@@ -8,10 +8,11 @@ Supported backends:
 * Vulkan
 * Metal
 * OpenGL 3
+* OpenGL ES 3
 
 [Veldrid documentation site](https://mellinoe.github.io/veldrid-docs/)
 
-[![Gitter chat](https://badges.gitter.im/gitterHQ/gitter.png)](https://gitter.im/veldrid/Lobby)
+[![Gitter chat](https://badges.gitter.im/veldrid/Lobby.svg)](https://gitter.im/veldrid/Lobby)
 
 Veldrid is available on NuGet:
 
@@ -19,10 +20,10 @@ Veldrid is available on NuGet:
 
 Pre-release versions of Veldrid are also available from MyGet: https://www.myget.org/feed/mellinoe/package/nuget/Veldrid
 
-![Sponza](https://i.imgur.com/QDaXwWL.jpg)
+![Sponza](https://i.imgur.com/p6juqm9.jpg)
 
 ### Build instructions
 
 Veldrid  uses the standard .NET Core tooling. [Install the tools](https://www.microsoft.com/net/download/core) and build normally (`dotnet build`).
 
-Run the RenderDemo program to see a quick demonstration of the rendering capabilities of the library.
+Run the NeoDemo program to see a quick demonstration of the rendering capabilities of the library.
